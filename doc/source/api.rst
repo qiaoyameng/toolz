@@ -11,6 +11,7 @@ Itertoolz
 
 .. autosummary::
    accumulate
+   chunked_scan
    concat
    concatv
    cons

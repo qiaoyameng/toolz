@@ -13,7 +13,8 @@ __all__ = ('remove', 'accumulate', 'groupby', 'merge_sorted', 'interleave',
            'first', 'second', 'nth', 'last', 'get', 'concat', 'concatv',
            'mapcat', 'cons', 'interpose', 'frequencies', 'reduceby', 'iterate',
            'sliding_window', 'partition', 'partition_all', 'count', 'pluck',
-           'join', 'tail', 'diff', 'topk', 'peek', 'peekn', 'random_sample')
+           'join', 'tail', 'diff', 'topk', 'peek', 'peekn', 'random_sample',
+           'chunked_scan')
 
 
 def remove(predicate, seq):
@@ -66,6 +67,211 @@ def accumulate(binop, seq, initial=no_default):
     for elem in seq:
         result = binop(result, elem)
         yield result
+
+
+def _local_prefixes(binop, chunk):
+    """Inclusive prefix scan of one materialized chunk.
+
+    Returns ``(prefixes, total)`` where ``prefixes[i]`` is the inclusive
+    fold of ``chunk[:i + 1]`` and ``total`` is the fold of the whole chunk.
+    The chunk is never reordered.
+    """
+    prefixes = []
+    total = chunk[0]
+    prefixes.append(total)
+    for elem in chunk[1:]:
+        total = binop(total, elem)
+        prefixes.append(total)
+    return prefixes, total
+
+
+class _ChunkedScanIterator:
+    """Lazy driver for ``chunked_scan``; see that function for semantics."""
+
+    def __init__(self, binop, seq, initial, exclusive,
+                 chunksize, max_in_flight, executor):
+        self._binop = binop
+        self._seq = iter(seq)
+        self._exclusive = exclusive
+        self._chunksize = chunksize
+        self._max_in_flight = max_in_flight
+        self._executor = executor
+        self._has_initial = initial is not no_default
+        self._carry = initial
+        self._pending = collections.deque()
+        self._exhausted = False
+        self.items_consumed = 0
+        self.items_readahead = 0
+        self.peak_readahead = 0
+        self.peak_in_flight = 0
+        self.chunks_submitted = 0
+        self._gen = self._run()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._gen)
+
+    def close(self):
+        """Stop consuming the input and release any outstanding work."""
+        self._gen.close()
+
+    def _note_readahead(self, n):
+        self.items_readahead += n
+        if self.items_readahead > self.peak_readahead:
+            self.peak_readahead = self.items_readahead
+
+    def _submit(self, chunk):
+        if self._executor is None:
+            future = None
+            result = _local_prefixes(self._binop, chunk)
+        else:
+            future = self._executor.submit(_local_prefixes, self._binop, chunk)
+            result = None
+        self._pending.append([len(chunk), future, result])
+        self.chunks_submitted += 1
+        in_flight = len(self._pending)
+        if in_flight > self.peak_in_flight:
+            self.peak_in_flight = in_flight
+
+    def _fill(self):
+        while not self._exhausted and len(self._pending) < self._max_in_flight:
+            chunk = list(itertools.islice(self._seq, self._chunksize))
+            if not chunk:
+                self._exhausted = True
+                break
+            self.items_consumed += len(chunk)
+            self._note_readahead(len(chunk))
+            self._submit(chunk)
+
+    def _run(self):
+        # For an inclusive scan without an initial value the first chunk is
+        # emitted without a running block prefix; afterwards ``_carry`` is the
+        # ordered fold of every block processed so far.
+        first_block = not self._has_initial
+        prev = self._carry if self._has_initial else None
+        try:
+            if self._has_initial and not self._exclusive:
+                yield self._carry
+            while True:
+                self._fill()
+                if not self._pending:
+                    break
+                entry = self._pending.popleft()
+                size, future, result = entry
+                if future is not None:
+                    result = future.result()
+                prefixes, total = result
+                if first_block:
+                    block_prefix = None
+                    new_carry = total
+                else:
+                    block_prefix = self._binop(self._carry, total)
+                    new_carry = block_prefix
+                for value in prefixes:
+                    if block_prefix is None:
+                        yield value
+                        continue
+                    value = self._binop(self._carry, value)
+                    if self._exclusive:
+                        yield prev
+                        prev = value
+                    else:
+                        yield value
+                self._carry = new_carry
+                first_block = False
+                self.items_readahead -= size
+        finally:
+            for entry in self._pending:
+                future = entry[1]
+                if future is not None:
+                    future.cancel()
+
+
+def chunked_scan(binop, seq, initial=no_default, *, exclusive=False,
+                 chunksize=128, max_in_flight=4, executor=None):
+    """ Prefix scan of ``seq`` computed in associative chunks
+
+    ``binop`` must be associative.  It does not need to be commutative:
+    chunks and elements are never reordered, so operators such as string
+    concatenation or ordered matrix/affine composition are valid.
+
+    Each chunk first receives a local inclusive prefix scan.  Chunk totals
+    are then folded in the original input order to obtain a running block
+    prefix, which is combined with every local prefix.  When ``executor``
+    is supplied (an ``Executor`` from :mod:`concurrent.futures` such as
+    ``concurrent.futures.ThreadPoolExecutor``), chunk work runs there while
+    at most ``max_in_flight`` chunks are outstanding at once.  The input is
+    consumed only once and only on the calling thread, bounded by
+    ``chunksize * max_in_flight`` items of read-ahead.  With ``executor``
+    omitted the chunks are evaluated inline in the same order, which still
+    matches :func:`accumulate`.
+
+    By default this is an *inclusive* scan.  Passing ``initial`` prepends
+    that value, exactly as in :func:`accumulate`.  Passing
+    ``exclusive=True`` performs an exclusive scan: the emitted value at
+    each position is the fold of the preceding elements (or ``initial`` at
+    the first position); ``initial`` is then required.
+
+    The returned object is a lazy iterator that also records how much of
+    ``seq`` was actually pulled ahead on the attributes
+    ``items_consumed``, ``items_readahead``, ``peak_readahead`` and
+    ``peak_in_flight``.  Iteration stops submitting new work as soon as the
+    input ends, a chunk fails, or the iterator is closed early; pending
+    futures are cancelled on failure or early close.
+
+    >>> from operator import add
+    >>> list(chunked_scan(add, [1, 2, 3, 4, 5], chunksize=2))
+    [1, 3, 6, 10, 15]
+    >>> list(chunked_scan(add, [1, 2, 3, 4], initial=0, chunksize=2))
+    [0, 1, 3, 6, 10]
+    >>> list(chunked_scan(add, [1, 2, 3, 4], initial=0,
+    ...                   exclusive=True, chunksize=2))
+    [0, 1, 3, 6]
+
+    Non-commutative associative operators keep the input order:
+
+    >>> list(chunked_scan(add, ['a', 'b', 'c', 'd'], chunksize=2))
+    ['a', 'ab', 'abc', 'abcd']
+
+    Empty inputs are defined:
+
+    >>> list(chunked_scan(add, []))
+    []
+    >>> list(chunked_scan(add, [], initial=0))
+    [0]
+    >>> list(chunked_scan(add, [], initial=0, exclusive=True))
+    []
+
+    Parameters
+    ----------
+    binop : callable
+        Associative binary operator ``(a, b) -> a * b``.  Need not be
+        commutative; operands are never reordered.
+    seq : iterable
+        Consumed exactly once.
+    initial : optional
+        Starting value.  Required when ``exclusive`` is true.
+    exclusive : bool, optional
+        Emit the prefix of preceding elements instead of including the
+        current element.
+    chunksize : int, optional
+        Maximum number of elements materialized into one chunk.
+    max_in_flight : int, optional
+        Maximum number of submitted chunks that have not been folded back.
+    executor : concurrent.futures.Executor, optional
+        Executor used to run local chunk scans.  Defaults to inline
+        evaluation.
+    """
+    if not isinstance(chunksize, int) or chunksize < 1:
+        raise ValueError('chunksize must be a positive integer')
+    if not isinstance(max_in_flight, int) or max_in_flight < 1:
+        raise ValueError('max_in_flight must be a positive integer')
+    if exclusive and initial is no_default:
+        raise ValueError('exclusive scan requires an initial value')
+    return _ChunkedScanIterator(binop, seq, initial, exclusive,
+                                chunksize, max_in_flight, executor)
 
 
 def groupby(key, seq):

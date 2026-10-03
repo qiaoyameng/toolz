@@ -1,5 +1,6 @@
 import itertools
 from itertools import starmap
+import pytest
 from toolz.utils import raises
 from functools import partial
 from random import Random
@@ -11,10 +12,16 @@ from toolz.itertoolz import (remove, groupby, merge_sorted,
                              nth, take, tail, drop, interpose, get,
                              rest, last, cons, frequencies,
                              reduceby, iterate, accumulate,
+                             chunked_scan,
                              sliding_window, count, partition,
                              partition_all, take_nth, pluck, join,
                              diff, topk, peek, peekn, random_sample)
 from operator import add, mul
+
+
+def strconcat(a, b):
+    """Non-commutative associative operator (ordered string append)."""
+    return a + b
 
 
 # is comparison will fail between this and no_default
@@ -590,3 +597,189 @@ def test_random_sample():
     assert mk_rsample(b"a") == mk_rsample("a")
 
     assert raises(TypeError, lambda: mk_rsample([]))
+
+
+# ---------------------------------------------------------------------------
+# chunked_scan
+# ---------------------------------------------------------------------------
+
+
+class _ManualFuture:
+    """Deterministic Executor stand-in for ``concurrent.futures`` semantics."""
+
+    def __init__(self, func, args, kwargs):
+        self._func = func
+        self._args = args
+        self._kwargs = kwargs
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+        return True
+
+    def result(self):
+        if self.cancelled:
+            raise RuntimeError('future was cancelled')
+        return self._func(*self._args, **self._kwargs)
+
+
+class _ManualExecutor:
+    """Runs work only when a result is requested, never out of order."""
+
+    def __init__(self):
+        self.submitted = []
+        self.cancelled = []
+
+    def submit(self, func, *args, **kwargs):
+        future = _ManualFuture(func, args, kwargs)
+        self.submitted.append(future)
+        return future
+
+
+def _compose_affine(a, b):
+    # (m, b) represents the affine map x -> m*x + b; apply a then b
+    return (a[0] * b[0], b[0] * a[1] + b[1])
+
+
+@pytest.mark.parametrize('chunksize', [1, 2, 3, 5, 7, 128])
+@pytest.mark.parametrize('n', list(range(0, 13)) + [50])
+def test_chunked_scan_matches_accumulate(n, chunksize):
+    seq = [str(i) + ',' for i in range(n)]
+    assert list(chunked_scan(strconcat, seq, chunksize=chunksize)) == \
+        list(accumulate(strconcat, seq))
+    got = chunked_scan(strconcat, seq, initial='z', chunksize=chunksize)
+    assert list(got) == list(accumulate(strconcat, seq, 'z'))
+    expected_exclusive = list(accumulate(strconcat, seq, 'z'))[:-1]
+    assert list(chunked_scan(strconcat, seq, initial='z', exclusive=True,
+                             chunksize=chunksize)) == expected_exclusive
+
+
+def test_chunked_scan_with_matrix_style_operator():
+    seq = [(1, 1), (2, 0), (1, -3), (3, 2), (0, 5)]
+    for chunksize in (1, 2, 3, 10):
+        assert list(chunked_scan(_compose_affine, seq,
+                                 chunksize=chunksize)) == \
+            list(accumulate(_compose_affine, seq))
+        assert list(chunked_scan(_compose_affine, seq, initial=(1, 0),
+                                 exclusive=True, chunksize=chunksize)) == \
+            list(accumulate(_compose_affine, seq, (1, 0)))[:-1]
+
+
+def test_chunked_scan_empty_input():
+    assert list(chunked_scan(strconcat, [])) == []
+    assert list(chunked_scan(strconcat, [], initial='z')) == ['z']
+    assert list(chunked_scan(strconcat, [], initial='z', exclusive=True)) == []
+
+
+def test_chunked_scan_validation():
+    assert raises(ValueError, lambda: chunked_scan(add, [1], exclusive=True))
+    assert raises(ValueError, lambda: chunked_scan(add, [1], chunksize=0))
+    assert raises(ValueError, lambda: chunked_scan(add, [1], chunksize=-1))
+    assert raises(ValueError,
+                  lambda: chunked_scan(add, [1], max_in_flight=0))
+    assert raises(ValueError,
+                  lambda: chunked_scan(add, [1], max_in_flight=-2))
+
+
+def test_chunked_scan_consumes_iterator_once():
+    data = iter(range(20))
+    result = chunked_scan(add, data, chunksize=4, max_in_flight=3)
+    assert list(result) == list(accumulate(add, range(20)))
+    assert result.items_consumed == 20
+    assert list(data) == []
+
+
+def test_chunked_scan_limits_in_flight_and_readahead():
+    executor = _ManualExecutor()
+    result = chunked_scan(add, range(1, 11), chunksize=3, max_in_flight=2,
+                          executor=executor)
+    assert result.chunks_submitted == 0
+    assert next(result) == 1
+    # Two blocks were submitted up front (3 + 3 = 6 items of read-ahead)
+    assert len(executor.submitted) == 2
+    assert result.chunks_submitted == 2
+    assert result.peak_in_flight == 2
+    assert result.peak_readahead == 6
+    rest = list(result)
+    assert rest == list(accumulate(add, range(1, 11)))[1:]
+    assert result.items_consumed == 10
+    assert result.peak_readahead == 6
+    assert result.peak_in_flight == 2
+    assert result.chunks_submitted == 4
+
+
+def test_chunked_scan_thread_executor_order():
+    from concurrent.futures import ThreadPoolExecutor
+    seq = ['%d:' % i for i in range(200)]
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        result = chunked_scan(strconcat, seq, chunksize=16, max_in_flight=4,
+                              executor=executor)
+        values = list(result)
+    assert values == list(accumulate(strconcat, seq))
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        result = chunked_scan(_compose_affine,
+                              [(i % 3, i - 2) for i in range(200)],
+                              initial=(1, 0), exclusive=True,
+                              chunksize=16, max_in_flight=4,
+                              executor=executor)
+        affine = list(result)
+    expected = list(accumulate(_compose_affine,
+                               [(i % 3, i - 2) for i in range(200)],
+                               (1, 0)))[:-1]
+    assert affine == expected
+
+
+def test_chunked_scan_early_close_stops_submission():
+    executor = _ManualExecutor()
+    result = chunked_scan(add, range(1, 101), chunksize=4, max_in_flight=2,
+                          executor=executor)
+    assert next(result) == 1
+    assert next(result) == 3
+    submitted_before_close = len(executor.submitted)
+    result.close()
+    assert len(executor.submitted) == submitted_before_close
+    # The block already being consumed cannot be cancelled; the rest can.
+    assert all(f.cancelled for f in executor.submitted[1:])
+
+
+def test_chunked_scan_failing_chunk_stops_submission():
+    def fail_on_seven(a, b):
+        if b == 7:
+            raise ValueError('boom')
+        return a + b
+
+    executor = _ManualExecutor()
+    result = chunked_scan(fail_on_seven, range(20), chunksize=2,
+                          max_in_flight=4, executor=executor)
+    assert raises(ValueError, lambda: list(result))
+    submitted = len(executor.submitted)
+    consumed = result.items_consumed
+    # The iterator is exhausted after failure: iterating again neither
+    # resubmits work nor reads more of the input.
+    assert list(result) == []
+    assert len(executor.submitted) == submitted
+    assert result.items_consumed == consumed
+    assert any(f.cancelled for f in executor.submitted)
+    assert consumed <= 2 * submitted
+
+
+def test_chunked_scan_failing_input_stops_submission():
+    class Boom(Exception):
+        pass
+
+    def data():
+        yield 1
+        yield 2
+        raise Boom()
+
+    executor = _ManualExecutor()
+    result = chunked_scan(add, data(), chunksize=1, max_in_flight=2,
+                          executor=executor)
+    assert raises(Boom, lambda: list(result))
+
+
+def test_chunked_scan_curried():
+    from toolz.curried import chunked_scan as cscan
+    assert list(cscan(strconcat, chunksize=2)(['a', 'b', 'c'])) == \
+        ['a', 'ab', 'abc']

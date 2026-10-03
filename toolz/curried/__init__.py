@@ -58,6 +58,7 @@ from .exceptions import merge, merge_with
 accumulate = toolz.curry(toolz.accumulate)
 assoc = toolz.curry(toolz.assoc)
 assoc_in = toolz.curry(toolz.assoc_in)
+chunked_scan = toolz.curry(toolz.chunked_scan)
 cons = toolz.curry(toolz.cons)
 countby = toolz.curry(toolz.countby)
 dissoc = toolz.curry(toolz.dissoc)
