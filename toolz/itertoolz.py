@@ -13,7 +13,8 @@ __all__ = ('remove', 'accumulate', 'groupby', 'merge_sorted', 'interleave',
            'first', 'second', 'nth', 'last', 'get', 'concat', 'concatv',
            'mapcat', 'cons', 'interpose', 'frequencies', 'reduceby', 'iterate',
            'sliding_window', 'partition', 'partition_all', 'count', 'pluck',
-           'join', 'tail', 'diff', 'topk', 'peek', 'peekn', 'random_sample')
+           'join', 'merge_join', 'tail', 'diff', 'topk', 'peek', 'peekn',
+           'random_sample')
 
 
 def remove(predicate, seq):
@@ -924,6 +925,140 @@ def join(leftkey, leftseq, rightkey, rightseq,
             if key not in seen_keys:
                 for match in matches:
                     yield (match, right_default)
+
+
+def merge_join(leftkey, leftseq, rightkey, rightseq,
+               left_default=no_default, right_default=no_default):
+    """ Merge join two sequences sorted by their join keys
+
+    Unlike :func:`join`, this operation does not store either entire
+    sequence.  It buffers only the current group of duplicate keys from each
+    side.
+
+    >>> identity = lambda x: x
+    >>> list(merge_join(identity, [1, 1, 2], identity, [1, 2, 2]))
+    [(1, 1), (1, 1), (2, 2), (2, 2)]
+
+    Output is ordered by key.  Within a matching key group, records retain
+    their left-sequence order and then their right-sequence order.  The
+    original records themselves do not need to support comparison; only their
+    keys are compared.
+
+    Use ``left_default`` and ``right_default`` independently for outer joins:
+
+    >>> list(merge_join(identity, [1, 2], identity, [2, 3],
+    ...                 left_default=None, right_default=None))
+    [(1, None), (2, 2), (None, 3)]
+
+    Both input sequences must be nondecreasing according to their respective
+    key functions.  If a consumed key decreases, ``ValueError`` is raised.
+    Results for earlier key groups may already have been produced; the
+    current key group is emitted only after its boundary has been consumed
+    and checked.
+
+    See Also:
+        join
+    """
+    if not callable(leftkey):
+        leftkey = getter(leftkey)
+    if not callable(rightkey):
+        rightkey = getter(rightkey)
+
+    def ordered_keyed(seq, key, side):
+        iterator = iter(seq)
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return
+
+        previous_key = key(item)
+        yield item, previous_key
+        for item in iterator:
+            current_key = key(item)
+            if current_key < previous_key:
+                raise ValueError(
+                    'merge_join requires %sseq to be sorted by %skey'
+                    % (side, side))
+            previous_key = current_key
+            yield item, current_key
+
+    def next_group(state, pairs):
+        first_item, first_key = state
+        group = [first_item]
+        for state in pairs:
+            item, key = state
+            if key != first_key:
+                return group, state
+            group.append(item)
+        return group, None
+
+    left_pairs = ordered_keyed(leftseq, leftkey, 'left')
+    left_state = next(left_pairs, None)
+    if left_state is None:
+        if left_default is not no_default:
+            right_pairs = ordered_keyed(rightseq, rightkey, 'right')
+            right_state = next(right_pairs, None)
+            while right_state is not None:
+                right_group, right_state = next_group(
+                    right_state, right_pairs)
+                for item in right_group:
+                    yield left_default, item
+        return
+
+    right_pairs = ordered_keyed(rightseq, rightkey, 'right')
+    right_state = next(right_pairs, None)
+    if right_state is None:
+        if right_default is not no_default:
+            while left_state is not None:
+                left_group, left_state = next_group(
+                    left_state, left_pairs)
+                for item in left_group:
+                    yield item, right_default
+        return
+
+    while True:
+        if left_state is None and right_state is None:
+            return
+
+        left_key = left_state[1]
+        right_key = right_state[1]
+
+        if left_key == right_key:
+            left_group, left_state = next_group(left_state, left_pairs)
+            right_group, right_state = next_group(right_state, right_pairs)
+            for left_item in left_group:
+                for right_item in right_group:
+                    yield left_item, right_item
+
+        elif left_key < right_key:
+            left_group, left_state = next_group(left_state, left_pairs)
+            if right_default is not no_default:
+                for left_item in left_group:
+                    yield left_item, right_default
+
+        else:
+            right_group, right_state = next_group(right_state, right_pairs)
+            if left_default is not no_default:
+                for right_item in right_group:
+                    yield left_default, right_item
+
+        if left_state is None and right_state is not None:
+            if left_default is not no_default:
+                while right_state is not None:
+                    right_group, right_state = next_group(
+                        right_state, right_pairs)
+                    for item in right_group:
+                        yield left_default, item
+            return
+
+        if right_state is None and left_state is not None:
+            if right_default is not no_default:
+                while left_state is not None:
+                    left_group, left_state = next_group(
+                        left_state, left_pairs)
+                    for item in left_group:
+                        yield item, right_default
+            return
 
 
 def diff(*seqs, **kwargs):

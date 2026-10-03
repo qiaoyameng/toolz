@@ -30,6 +30,7 @@ Itertoolz
    last
    mapcat
    merge_sorted
+   merge_join
    nth
    partition
    partition_all

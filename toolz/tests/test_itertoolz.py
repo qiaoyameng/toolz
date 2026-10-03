@@ -13,7 +13,8 @@ from toolz.itertoolz import (remove, groupby, merge_sorted,
                              reduceby, iterate, accumulate,
                              sliding_window, count, partition,
                              partition_all, take_nth, pluck, join,
-                             diff, topk, peek, peekn, random_sample)
+                             merge_join, diff, topk, peek, peekn,
+                             random_sample)
 from operator import add, mul
 
 
@@ -39,6 +40,20 @@ def inc(x):
 
 def double(x):
     return 2 * x
+
+
+class CountingIterator:
+    def __init__(self, seq):
+        self.seq = iter(seq)
+        self.consumed = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        value = next(self.seq)
+        self.consumed += 1
+        return value
 
 
 def test_remove():
@@ -495,6 +510,162 @@ def test_outer_join():
     expected = {(2, 2), (1, None), (None, 3)}
 
     assert result == expected
+
+
+def test_merge_join():
+    left = [(1, 'a'), (1, 'b'), (2, 'c'), (4, 'd')]
+    right = [(1, 'x'), (2, 'y'), (2, 'z'), (3, 'w')]
+
+    assert list(merge_join(0, left, 0, right)) == [
+        ((1, 'a'), (1, 'x')),
+        ((1, 'b'), (1, 'x')),
+        ((2, 'c'), (2, 'y')),
+        ((2, 'c'), (2, 'z')),
+    ]
+
+    assert list(merge_join(0, left, 0, right, left_default=None)) == [
+        ((1, 'a'), (1, 'x')),
+        ((1, 'b'), (1, 'x')),
+        ((2, 'c'), (2, 'y')),
+        ((2, 'c'), (2, 'z')),
+        (None, (3, 'w')),
+    ]
+
+    assert list(merge_join(0, left, 0, right, right_default=None)) == [
+        ((1, 'a'), (1, 'x')),
+        ((1, 'b'), (1, 'x')),
+        ((2, 'c'), (2, 'y')),
+        ((2, 'c'), (2, 'z')),
+        ((4, 'd'), None),
+    ]
+
+    assert list(merge_join(0, left, 0, right,
+                           left_default='L', right_default='R')) == [
+        ((1, 'a'), (1, 'x')),
+        ((1, 'b'), (1, 'x')),
+        ((2, 'c'), (2, 'y')),
+        ((2, 'c'), (2, 'z')),
+        ('L', (3, 'w')),
+        ((4, 'd'), 'R'),
+    ]
+
+    assert list(merge_join(identity, [1, 2], identity, [1, 2],
+                           left_default='L', right_default='R')) == [
+        (1, 1),
+        (2, 2),
+    ]
+
+
+def test_merge_join_empty_input():
+    assert list(merge_join(identity, [], identity, [])) == []
+    assert list(merge_join(identity, [], identity, [1, 2],
+                           left_default=None)) == [(None, 1), (None, 2)]
+    assert list(merge_join(identity, [1, 2], identity, [],
+                           right_default=None)) == [(1, None), (2, None)]
+
+
+def test_merge_join_actual_value_equals_default():
+    left = [(1, 'match'), (2, None)]
+    right = [(1, 'right'), (3, 'only-right')]
+
+    result = list(merge_join(0, left, 0, right,
+                             left_default=False, right_default=None))
+
+    assert result == [
+        ((1, 'match'), (1, 'right')),
+        ((2, None), None),
+        (False, (3, 'only-right')),
+    ]
+
+    result = list(merge_join(identity, [], identity, [1],
+                             left_default=no_default2))
+    assert result == [(no_default2, 1)]
+
+
+def test_merge_join_records_need_not_be_comparable():
+    class Record:
+        def __init__(self, key, label):
+            self.key = key
+            self.label = label
+            self.key_calls = 0
+
+        def get_key(self):
+            self.key_calls += 1
+            return self.key
+
+    left = [Record(1, 'a'), Record(1, 'b'), Record(2, 'c')]
+    right = [Record(1, 'x'), Record(2, 'y'), Record(2, 'z')]
+
+    result = list(merge_join(Record.get_key, left, Record.get_key, right))
+
+    assert ([(item[0].key, item[0].label, item[1].label) for item in result]
+            == [(1, 'a', 'x'), (1, 'b', 'x'),
+                (2, 'c', 'y'), (2, 'c', 'z')])
+    assert [record.key_calls for record in left + right] == [1] * 6
+
+
+def test_merge_join_pull_boundaries():
+    left = CountingIterator([(1, 'a'), (1, 'b'), (2, 'c'), (3, 'd')])
+    right = CountingIterator([(1, 'x'), (2, 'y'), (2, 'z'), (3, 'w')])
+    result = merge_join(0, left, 0, right)
+
+    assert left.consumed == 0
+    assert right.consumed == 0
+
+    first = next(result)
+    assert first == ((1, 'a'), (1, 'x'))
+    assert (left.consumed, right.consumed) == (3, 2)
+
+    assert list(result) == [
+        ((1, 'b'), (1, 'x')),
+        ((2, 'c'), (2, 'y')),
+        ((2, 'c'), (2, 'z')),
+        ((3, 'd'), (3, 'w')),
+    ]
+    assert (left.consumed, right.consumed) == (4, 4)
+
+    left = CountingIterator([(1, 'a'), (2, 'b')])
+    right = CountingIterator([(1, 'x')])
+    result = merge_join(0, left, 0, right)
+    assert next(result) == ((1, 'a'), (1, 'x'))
+    assert (left.consumed, right.consumed) == (2, 1)
+    assert list(result) == []
+
+    right = CountingIterator([1, 2])
+    result = merge_join(identity, [], identity, right)
+    assert list(result) == []
+    assert right.consumed == 0
+
+
+def test_merge_join_unsorted():
+    result = merge_join(identity, [1, 0], identity, [1])
+    assert raises(ValueError, lambda: list(result))
+
+    left = CountingIterator([0, 1, 0])
+    right = CountingIterator([0, 1])
+    result = merge_join(identity, left, identity, right)
+    assert next(result) == (0, 0)
+    assert raises(ValueError, lambda: list(result))
+    assert (left.consumed, right.consumed) == (3, 2)
+
+    result = merge_join(identity, [0, 1, 1], identity, [0, 1, 0])
+    assert next(result) == (0, 0)
+    assert raises(ValueError, lambda: list(result))
+
+    result = merge_join(identity, [0, 1, 2, 0], identity, [0, 1, 2])
+    assert next(result) == (0, 0)
+    assert next(result) == (1, 1)
+    assert raises(ValueError, lambda: list(result))
+
+    result = merge_join(identity, [], identity, [0, 1, 0],
+                        left_default=None)
+    assert next(result) == (None, 0)
+    assert raises(ValueError, lambda: list(result))
+
+    result = merge_join(identity, [0], identity, [0, 1, 0],
+                        left_default=None)
+    assert next(result) == (0, 0)
+    assert raises(ValueError, lambda: list(result))
 
 
 def test_diff():
