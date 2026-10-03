@@ -13,7 +13,8 @@ __all__ = ('remove', 'accumulate', 'groupby', 'merge_sorted', 'interleave',
            'first', 'second', 'nth', 'last', 'get', 'concat', 'concatv',
            'mapcat', 'cons', 'interpose', 'frequencies', 'reduceby', 'iterate',
            'sliding_window', 'partition', 'partition_all', 'count', 'pluck',
-           'join', 'tail', 'diff', 'topk', 'peek', 'peekn', 'random_sample')
+           'join', 'merge_join', 'tail', 'diff', 'topk', 'peek', 'peekn',
+           'random_sample')
 
 
 def remove(predicate, seq):
@@ -924,6 +925,129 @@ def join(leftkey, leftseq, rightkey, rightseq,
             if key not in seen_keys:
                 for match in matches:
                     yield (match, right_default)
+
+
+def _merge_join_groups(seq, key, name):
+    """ Yield ``(key, group)`` pairs from a key-sorted sequence
+
+    ``key`` is called exactly once per item.  A ``ValueError`` is raised if
+    an item's key is smaller than the key of the previous group.
+    """
+    it = iter(seq)
+    try:
+        item = next(it)
+    except StopIteration:
+        return
+    group_key = key(item)
+    group = [item]
+    for item in it:
+        item_key = key(item)
+        if item_key == group_key:
+            group.append(item)
+        else:
+            if item_key < group_key:
+                raise ValueError(
+                    '%s is not sorted in ascending key order: key %r '
+                    'follows key %r. Results for keys less than or equal '
+                    'to %r may already have been emitted before this '
+                    'error was detected.' % (name, item_key, group_key,
+                                             group_key))
+            yield group_key, group
+            group_key = item_key
+            group = [item]
+    yield group_key, group
+
+
+def merge_join(leftkey, leftseq, rightkey, rightseq,
+               left_default=no_default, right_default=no_default):
+    """ Merge join two key-sorted sequences on common attributes
+
+    Unlike ``join``, which buffers the entire left sequence in memory, this
+    is a fully streaming operation: both sequences must be sorted in
+    ascending key order, and only the current run of duplicate keys is held
+    in memory.  Memory use is proportional to the size of the current
+    duplicate-key groups, not to the size of the inputs.
+
+    Results are emitted in ascending key order.  For each key, every left
+    item is paired with every right item (many-to-many), preserving the
+    original order of both sequences within the key.  Only keys are
+    compared; the items themselves never need to be comparable, and each
+    key function is called exactly once per item.
+
+    >>> left = [(1, 'a'), (1, 'b'), (2, 'c')]
+    >>> right = [(1, 'x'), (2, 'y'), (2, 'z'), (3, 'w')]
+    >>> for pair in merge_join(first, left, first, right):
+    ...     print(pair)
+    ((1, 'a'), (1, 'x'))
+    ((1, 'b'), (1, 'x'))
+    ((2, 'c'), (2, 'y'))
+    ((2, 'c'), (2, 'z'))
+
+    Specify outer joins with keyword arguments ``left_default`` and/or
+    ``right_default``.  Unmatched items from either side are paired with
+    the corresponding default, also in key order.
+
+    >>> for pair in merge_join(first, left, first, right,
+    ...                        left_default=None, right_default=None):
+    ...     print(pair)
+    ((1, 'a'), (1, 'x'))
+    ((1, 'b'), (1, 'x'))
+    ((2, 'c'), (2, 'y'))
+    ((2, 'c'), (2, 'z'))
+    (None, (3, 'w'))
+
+    Usually the key arguments are callables to be applied to the sequences.
+    If the keys are not obviously callable then it is assumed that indexing
+    was intended, e.g. ``merge_join(0, left, 1, right)``.
+
+    Both inputs must be sorted in ascending key order.  A ``ValueError`` is
+    raised when an out-of-order key is detected; because the join is lazy,
+    results for keys up to that point may already have been emitted.
+
+    See Also:
+        join
+        merge_sorted
+    """
+    if not callable(leftkey):
+        leftkey = getter(leftkey)
+    if not callable(rightkey):
+        rightkey = getter(rightkey)
+
+    lefts = _merge_join_groups(leftseq, leftkey, 'leftseq')
+    rights = _merge_join_groups(rightseq, rightkey, 'rightseq')
+
+    left_key, left_group = next(lefts, (None, None))
+    right_key, right_group = next(rights, (None, None))
+
+    while left_group is not None and right_group is not None:
+        if left_key == right_key:
+            for left_item in left_group:
+                for right_item in right_group:
+                    yield (left_item, right_item)
+            left_key, left_group = next(lefts, (None, None))
+            right_key, right_group = next(rights, (None, None))
+        elif left_key < right_key:
+            if right_default is not no_default:
+                for left_item in left_group:
+                    yield (left_item, right_default)
+            left_key, left_group = next(lefts, (None, None))
+        else:
+            if left_default is not no_default:
+                for right_item in right_group:
+                    yield (left_default, right_item)
+            right_key, right_group = next(rights, (None, None))
+
+    if right_default is not no_default:
+        while left_group is not None:
+            for left_item in left_group:
+                yield (left_item, right_default)
+            left_key, left_group = next(lefts, (None, None))
+
+    if left_default is not no_default:
+        while right_group is not None:
+            for right_item in right_group:
+                yield (left_default, right_item)
+            right_key, right_group = next(rights, (None, None))
 
 
 def diff(*seqs, **kwargs):

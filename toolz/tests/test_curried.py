@@ -1,7 +1,7 @@
 import toolz
 import toolz.curried
 from toolz.curried import (take, first, second, sorted, merge_with, reduce,
-                           merge, operator as cop)
+                           merge, merge_join, operator as cop)
 from collections import defaultdict
 from importlib import import_module
 from operator import add
@@ -31,6 +31,18 @@ def test_merge_with_list():
 
 def test_sorted():
     assert sorted(key=second)([(1, 2), (2, 1)]) == [(2, 1), (1, 2)]
+
+
+def test_merge_join():
+    left = [(1, 'a'), (2, 'b')]
+    right = [(2, 'x'), (3, 'y')]
+    expected = [((2, 'b'), (2, 'x'))]
+    assert list(merge_join(first, left, first, right)) == expected
+    assert list(merge_join(first)(left)(first)(right)) == expected
+    outer = merge_join(first, left, first,
+                       left_default=None, right_default=None)
+    assert list(outer(right)) == [((1, 'a'), None), ((2, 'b'), (2, 'x')),
+                                  (None, (3, 'y'))]
 
 
 def test_reduce():

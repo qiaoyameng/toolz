@@ -29,6 +29,7 @@ Itertoolz
    join
    last
    mapcat
+   merge_join
    merge_sorted
    nth
    partition

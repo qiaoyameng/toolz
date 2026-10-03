@@ -13,7 +13,8 @@ from toolz.itertoolz import (remove, groupby, merge_sorted,
                              reduceby, iterate, accumulate,
                              sliding_window, count, partition,
                              partition_all, take_nth, pluck, join,
-                             diff, topk, peek, peekn, random_sample)
+                             merge_join, diff, topk, peek, peekn,
+                             random_sample)
 from operator import add, mul
 
 
@@ -495,6 +496,187 @@ def test_outer_join():
     expected = {(2, 2), (1, None), (None, 3)}
 
     assert result == expected
+
+
+class CountingIterator:
+    """ A one-shot iterator that counts the items consumed from it """
+    def __init__(self, seq):
+        self._it = iter(seq)
+        self.count = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = next(self._it)
+        self.count += 1
+        return item
+
+
+def test_merge_join():
+    left = [(1, 'a'), (1, 'b'), (2, 'c')]
+    right = [(1, 'x'), (2, 'y'), (2, 'z'), (3, 'w')]
+
+    result = list(merge_join(first, left, first, right))
+    expected = [((1, 'a'), (1, 'x')),
+                ((1, 'b'), (1, 'x')),
+                ((2, 'c'), (2, 'y')),
+                ((2, 'c'), (2, 'z'))]
+    assert result == expected
+
+
+def test_merge_join_many_to_many_order():
+    left = [(1, 'a'), (1, 'b'), (1, 'c')]
+    right = [(1, 'x'), (1, 'y')]
+
+    result = list(merge_join(first, left, first, right))
+    expected = [((1, 'a'), (1, 'x')), ((1, 'a'), (1, 'y')),
+                ((1, 'b'), (1, 'x')), ((1, 'b'), (1, 'y')),
+                ((1, 'c'), (1, 'x')), ((1, 'c'), (1, 'y'))]
+    assert result == expected
+
+
+def test_merge_join_defaults():
+    left = [(1, 'a'), (3, 'c')]
+    right = [(2, 'x'), (3, 'y'), (4, 'z')]
+
+    # results are emitted in key order, whichever side they come from
+    result = list(merge_join(first, left, first, right,
+                             left_default=None, right_default=None))
+    expected = [((1, 'a'), None),
+                (None, (2, 'x')),
+                ((3, 'c'), (3, 'y')),
+                (None, (4, 'z'))]
+    assert result == expected
+
+    # the two defaults are independent
+    result = list(merge_join(first, left, first, right, left_default=None))
+    assert result == [(None, (2, 'x')), ((3, 'c'), (3, 'y')), (None, (4, 'z'))]
+
+    result = list(merge_join(first, left, first, right, right_default=None))
+    assert result == [((1, 'a'), None), ((3, 'c'), (3, 'y'))]
+
+
+def test_merge_join_empty():
+    assert list(merge_join(identity, [], identity, [])) == []
+    assert list(merge_join(identity, [], identity, [1])) == []
+    assert list(merge_join(identity, [1], identity, [])) == []
+    assert list(merge_join(identity, [], identity, [],
+                           left_default=None, right_default=None)) == []
+
+    result = merge_join(identity, [], identity, [1, 2], left_default=None)
+    assert list(result) == [(None, 1), (None, 2)]
+
+    result = merge_join(identity, [1, 2], identity, [], right_default=None)
+    assert list(result) == [(1, None), (2, None)]
+
+
+def test_merge_join_key_as_getter():
+    left = [(1, 'a'), (2, 'b')]
+    right = [(2, 'x'), (3, 'y')]
+
+    result = list(merge_join(0, left, 0, right,
+                             left_default=None, right_default=None))
+    expected = [((1, 'a'), None), ((2, 'b'), (2, 'x')), (None, (3, 'y'))]
+    assert result == expected
+
+
+def test_merge_join_key_called_once():
+    left_calls = []
+    right_calls = []
+
+    def leftkey(item):
+        left_calls.append(item)
+        return item[0]
+
+    def rightkey(item):
+        right_calls.append(item)
+        return item[0]
+
+    left = [(1, 'a'), (1, 'b'), (2, 'c')]
+    right = [(1, 'x'), (3, 'y')]
+    list(merge_join(leftkey, left, rightkey, right,
+                    left_default=None, right_default=None))
+
+    assert left_calls == left
+    assert right_calls == right
+
+
+def test_merge_join_noncomparable_items():
+    # dicts do not support ordering; only the keys are ever compared
+    left = [{'k': 1, 'v': 'a'}, {'k': 2, 'v': 'b'}]
+    right = [{'k': 2, 'v': 'x'}, {'k': 3, 'v': 'y'}]
+
+    result = list(merge_join(lambda d: d['k'], left, lambda d: d['k'], right,
+                             left_default=None, right_default=None))
+    expected = [({'k': 1, 'v': 'a'}, None),
+                ({'k': 2, 'v': 'b'}, {'k': 2, 'v': 'x'}),
+                (None, {'k': 3, 'v': 'y'})]
+    assert result == expected
+
+
+def test_merge_join_value_equal_to_default():
+    # real records equal to the defaults are still treated as real records
+    result = list(merge_join(identity, [0, 1], identity, [1, 2],
+                             left_default=0, right_default=0))
+    assert result == [(0, 0), (1, 1), (0, 2)]
+
+
+def test_merge_join_unsorted():
+    result = merge_join(identity, [1, 3, 2], identity, [1, 2, 3])
+    # results before the out-of-order key are still emitted
+    assert next(result) == (1, 1)
+    assert raises(ValueError, lambda: list(result))
+
+    result = merge_join(identity, [1, 2], identity, [2, 1])
+    assert raises(ValueError, lambda: list(result))
+
+    try:
+        list(merge_join(identity, [2, 1], identity, []))
+    except ValueError as err:
+        assert 'leftseq' in str(err)
+        assert 'not sorted' in str(err)
+    else:
+        raise AssertionError('expected ValueError')
+
+    try:
+        list(merge_join(identity, [], identity, [2, 1]))
+    except ValueError as err:
+        assert 'rightseq' in str(err)
+    else:
+        raise AssertionError('expected ValueError')
+
+
+def test_merge_join_pull_boundaries():
+    left = CountingIterator([(1, 'a'), (2, 'b')])
+    right = CountingIterator([(1, 'x'), (3, 'y')])
+
+    result = merge_join(first, left, first, right)
+    # nothing is consumed until the first result is requested
+    assert left.count == 0
+    assert right.count == 0
+
+    assert next(result) == ((1, 'a'), (1, 'x'))
+    # each side is pulled only far enough to close the current key group
+    assert left.count == 2
+    assert right.count == 2
+
+    # inner join does not drain the remaining input once a side is exhausted
+    assert list(result) == []
+    assert left.count == 2
+    assert right.count == 2
+
+
+def test_merge_join_outer_pull_boundaries():
+    left = CountingIterator([(1, 'a'), (3, 'c')])
+    right = CountingIterator([(2, 'x')])
+
+    result = merge_join(first, left, first, right,
+                        left_default=None, right_default=None)
+    expected = [((1, 'a'), None), (None, (2, 'x')), ((3, 'c'), None)]
+    assert list(result) == expected
+    assert left.count == 2
+    assert right.count == 1
 
 
 def test_diff():
