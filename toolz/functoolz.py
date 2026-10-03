@@ -13,7 +13,7 @@ if sys.version_info >= (3, 14):
 
 __all__ = ('identity', 'apply', 'thread_first', 'thread_last', 'memoize',
            'compose', 'compose_left', 'pipe', 'complement', 'juxt', 'do',
-           'curry', 'flip', 'excepts')
+           'curry', 'placeholder', 'flip', 'excepts')
 
 PYPY = hasattr(sys, 'pypy_version_info')
 
@@ -166,6 +166,34 @@ class InstanceProperty(property):
         return InstanceProperty, state
 
 
+class Placeholder:
+    """ Type of the ``placeholder`` singleton used with ``curry``
+
+    There is a single instance, ``placeholder``, available as
+    ``toolz.placeholder`` and ``curry.placeholder``.  Pickling and copying
+    preserve the singleton's identity.
+    """
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = object.__new__(cls)
+        return cls._instance
+
+    def __repr__(self):
+        return 'placeholder'
+
+    def __reduce__(self):
+        return (Placeholder, ())
+
+
+placeholder = Placeholder()
+
+
+def _has_placeholder(args):
+    return any(arg is placeholder for arg in args)
+
+
 class curry:
     """ Curry a callable function
 
@@ -190,10 +218,29 @@ class curry:
     >>> add(2, 3)
     5
 
+    Explicit placeholders may skip positional arguments, to be filled in
+    by later calls.  Subsequent positional arguments fill the open slots
+    in order; extra arguments are appended after them.
+
+    >>> def f(a, b, c, d):
+    ...     return (a, b, c, d)
+    >>> f = curry(f)
+
+    >>> g = f(placeholder, 2, placeholder, 4)
+    >>> g(1, 3)
+    (1, 2, 3, 4)
+    >>> f(placeholder, 2)(1, 3, 4)
+    (1, 2, 3, 4)
+
+    The ``placeholder`` object is also available as ``curry.placeholder``
+    and ``toolz.placeholder``.
+
     See Also:
         toolz.curried - namespace of curried functions
                         https://toolz.readthedocs.io/en/latest/curry.html
     """
+    placeholder = placeholder
+
     def __init__(self, *args, **kwargs):
         if not args:
             raise TypeError('__init__() takes at least 2 arguments (1 given)')
@@ -227,6 +274,7 @@ class curry:
         self.__qualname__ = getattr(func, '__qualname__', None)
         self._sigspec = None
         self._has_unknown_args = None
+        self._has_placeholders = _has_placeholder(self._partial.args)
 
     @instanceproperty
     def func(self):
@@ -241,15 +289,26 @@ class curry:
             raise TypeError('curry object has incorrect arguments')
 
         params = list(sig.parameters.values())
-        skip = 0
-        for param in params[:len(args)]:
-            if param.kind == param.VAR_POSITIONAL:
+        # Positional arguments bind to the leading positional parameters;
+        # a placeholder leaves its parameter unbound.
+        bound = set()
+        argpos = 0
+        for i, param in enumerate(params):
+            if argpos >= len(args):
                 break
-            skip += 1
+            if param.kind in (param.POSITIONAL_ONLY,
+                              param.POSITIONAL_OR_KEYWORD):
+                if args[argpos] is not placeholder:
+                    bound.add(i)
+                argpos += 1
+            elif param.kind == param.VAR_POSITIONAL:
+                break
 
         kwonly = False
         newparams = []
-        for param in params[skip:]:
+        for i, param in enumerate(params):
+            if i in bound:
+                continue
             kind = param.kind
             default = param.default
             if kind == param.VAR_KEYWORD:
@@ -301,6 +360,8 @@ class curry:
         return not self.__eq__(other)
 
     def __call__(self, *args, **kwargs):
+        if self._has_placeholders or _has_placeholder(args):
+            return self._call_placeholder(args, kwargs)
         try:
             return self._partial(*args, **kwargs)
         except TypeError as exc:
@@ -308,11 +369,59 @@ class curry:
                 return self.bind(*args, **kwargs)
             raise
 
-    def _should_curry(self, args, kwargs, exc=None):
+    def _call_placeholder(self, args, kwargs):
+        args, kwargs = self._merge_placeholder_args(args, kwargs)
+        if _has_placeholder(args):
+            # Placeholders remain unfilled: curry without calling the
+            # function, but fail eagerly if the call can never be valid.
+            self._check_partial_args(args, kwargs)
+            return type(self)(self.func, *args, **kwargs)
+        try:
+            return self.func(*args, **kwargs)
+        except TypeError as exc:
+            if self._should_curry_merged(args, kwargs, exc):
+                return type(self)(self.func, *args, **kwargs)
+            raise
+
+    def _merge_placeholder_args(self, args, kwargs):
+        # Fill open placeholder slots with the new positional arguments,
+        # in order; extra arguments are appended after them.
+        stored = self._partial.args
+        if self._has_placeholders:
+            remaining = iter(args)
+            merged = [
+                next(remaining, placeholder) if arg is placeholder else arg
+                for arg in stored
+            ]
+            merged.extend(remaining)
+            args = tuple(merged)
+        else:
+            args = stored + args
+        if self.keywords:
+            kwargs = dict(self.keywords, **kwargs)
+        return args, kwargs
+
+    def _check_partial_args(self, args, kwargs):
         func = self.func
+        sigspec = self._sigspec
+        if sigspec is None:
+            sigspec = self._sigspec = _sigs.signature_or_spec(func)
+        if sigspec is not None:
+            is_partial = is_partial_args(func, args, kwargs, sigspec)
+        else:
+            # Signature unknown; consult the registry of known builtins
+            is_partial = _sigs._is_partial_args(func, args, kwargs)
+        if is_partial is False:
+            raise TypeError('curry object has incorrect arguments')
+
+    def _should_curry(self, args, kwargs, exc=None):
         args = self.args + args
         if self.keywords:
             kwargs = dict(self.keywords, **kwargs)
+        return self._should_curry_merged(args, kwargs, exc)
+
+    def _should_curry_merged(self, args, kwargs, exc=None):
+        func = self.func
         if self._sigspec is None:
             sigspec = self._sigspec = _sigs.signature_or_spec(func)
             self._has_unknown_args = has_varargs(func, sigspec) is not False
@@ -335,9 +444,20 @@ class curry:
             return False
 
     def bind(self, *args, **kwargs):
+        if self._has_placeholders or _has_placeholder(args):
+            args, kwargs = self._merge_placeholder_args(args, kwargs)
+            return type(self)(self.func, *args, **kwargs)
         return type(self)(self, *args, **kwargs)
 
     def call(self, *args, **kwargs):
+        if self._has_placeholders or _has_placeholder(args):
+            args, kwargs = self._merge_placeholder_args(args, kwargs)
+            if _has_placeholder(args):
+                raise TypeError(
+                    'curry.call() cannot complete: '
+                    'placeholders remain unfilled'
+                )
+            return self.func(*args, **kwargs)
         return self._partial(*args, **kwargs)
 
     def __get__(self, instance, owner):
@@ -370,7 +490,8 @@ class curry:
 
         # functools.partial objects can't be pickled
         userdict = tuple((k, v) for k, v in self.__dict__.items()
-                         if k not in ('_partial', '_sigspec'))
+                         if k not in ('_partial', '_sigspec',
+                                      '_has_placeholders'))
         state = (type(self), func, self.args, self.keywords, userdict,
                  is_decorated)
         return _restore_curry, state

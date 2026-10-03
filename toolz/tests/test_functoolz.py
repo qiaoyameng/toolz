@@ -6,7 +6,7 @@ import pytest
 import toolz
 from toolz.functoolz import (thread_first, thread_last, memoize, curry,
                              compose, compose_left, pipe, complement, do, juxt,
-                             flip, excepts, apply, Compose)
+                             flip, excepts, apply, Compose, placeholder)
 from operator import add, mul, itemgetter
 from toolz.utils import raises
 from functools import partial
@@ -497,6 +497,180 @@ def test_curry_unknown_args():
     assert f(1, 2)(3) == 6
     assert f(1, 2, 3) == 6
     assert f(1, 2)(3, 4) == f(1, 2, 3, 4)
+
+
+def test_curry_placeholder_simple():
+    def f(a, b, c, d):
+        return a, b, c, d
+
+    cf = curry(f)
+    # Fix the second and fourth positional arguments; fill the rest later
+    g = cf(placeholder, 2, placeholder, 4)
+    assert isinstance(g, curry)
+    assert g(1, 3) == (1, 2, 3, 4)
+    # Extra positional arguments are appended after open slots are filled
+    assert cf(placeholder, 2)(1, 3, 4) == (1, 2, 3, 4)
+    # Placeholders may be introduced across multiple calls
+    step = cf(placeholder)(1, placeholder)(2, placeholder)(3, placeholder)
+    assert isinstance(step, curry)
+    assert step(4) == (1, 2, 3, 4)
+    # Placeholders given at construction time work too
+    assert curry(f, placeholder, 2)(1, 3, 4) == (1, 2, 3, 4)
+    # The placeholder is a singleton, also exposed on curry and toolz
+    assert curry.placeholder is placeholder
+    assert toolz.placeholder is placeholder
+    assert repr(placeholder) == 'placeholder'
+
+
+def test_curry_placeholder_kwargs():
+    def f(a, b, c=10):
+        return a, b, c
+
+    cf = curry(f)
+    assert cf(placeholder, c=3)(1, 2) == (1, 2, 3)
+    assert cf(placeholder, 2)(1, c=3) == (1, 2, 3)
+    # Keyword arguments bind per the Python signature; a parameter may not
+    # be occupied both positionally and by keyword
+    assert raises(TypeError, lambda: cf(1, placeholder)(b=2))
+    assert raises(TypeError, lambda: cf(placeholder, 2)(1, b=5))
+
+
+def test_curry_placeholder_posonly_kwonly():
+    def f(a, b, /, c, *, d):
+        return a, b, c, d
+
+    cf = curry(f)
+    assert cf(placeholder, 2)(1, placeholder, d=4)(3) == (1, 2, 3, 4)
+    assert cf(1, placeholder)(2, 3, d=4) == (1, 2, 3, 4)
+    # Positional-only parameters cannot be filled by keyword
+    assert raises(TypeError, lambda: cf(placeholder, 2)(1, 3, b=5))
+
+
+def test_curry_placeholder_varargs():
+    def f(*args):
+        return args
+
+    cf = curry(f)
+    assert cf(placeholder, 2)(1) == (1, 2)
+    assert cf(placeholder, 2)(1, 3, 4) == (1, 2, 3, 4)
+
+    def add3(x, y, z):
+        return x + y + z
+
+    @curry
+    def g(*args):
+        return add3(*args)
+
+    assert g(placeholder, 2)(1, 3) == 6
+
+
+def test_curry_placeholder_defaults():
+    def f(a, b=2, c=3):
+        return a, b, c
+
+    cf = curry(f)
+    assert cf(placeholder)(1) == (1, 2, 3)
+    assert cf(placeholder, c=30)(1) == (1, 2, 30)
+    assert cf(placeholder, 20)(1) == (1, 20, 3)
+
+
+def test_curry_placeholder_method():
+    class A:
+        def __init__(self, x):
+            self.x = x
+
+        @curry
+        def method(self, a, b, c):
+            return self.x, a, b, c
+
+    a = A(0)
+    assert a.method(placeholder, 2)(1, 3) == (0, 1, 2, 3)
+    assert A.method(a, placeholder, 2)(1, 3) == (0, 1, 2, 3)
+
+
+def test_curry_placeholder_nested():
+    def f(a, b, c, d):
+        return a, b, c, d
+
+    inner = curry(f)(1, placeholder)
+    assert curry(inner)(2, placeholder, 4)(3) == (1, 2, 3, 4)
+    assert curry(inner)(placeholder, 3)(2, 4) == (1, 2, 3, 4)
+    # Filling all slots may still leave a normally-curried call
+    def g(a, b, c):
+        return a, b, c
+    assert curry(g)(1, placeholder)(2)(3) == (1, 2, 3)
+
+
+def test_curry_placeholder_signature():
+    def f(a, b, c):
+        return a + b + c
+
+    sig = inspect.signature(curry(f)(1, placeholder, 3))
+    assert list(sig.parameters) == ['b']
+
+    def g(a, b=2):
+        return a + b
+
+    sig = inspect.signature(curry(g)(placeholder))
+    assert list(sig.parameters) == ['a', 'b']
+    assert sig.parameters['b'].default == 2
+
+    def h(a, b, /, c):
+        return a + b + c
+
+    sig = inspect.signature(curry(h)(1, placeholder))
+    params = list(sig.parameters.values())
+    assert [p.name for p in params] == ['b', 'c']
+    assert params[0].kind == params[0].POSITIONAL_ONLY
+
+
+def test_curry_placeholder_typeerror_in_body():
+    @curry
+    def f(a, b):
+        if not isinstance(a, int):
+            raise TypeError('a must be an int')
+        return a + b
+
+    # The function is not called while placeholders remain unfilled
+    g = f(placeholder, 2)
+    assert isinstance(g, curry)
+    assert g(1) == 3
+    # A genuine TypeError raised by the function body is not mistaken
+    # for an incomplete call
+    assert raises(TypeError, lambda: g('1'))
+    assert raises(TypeError, lambda: f(placeholder, 2)('1', 3))
+
+
+def test_curry_placeholder_call():
+    @curry
+    def add(x, y):
+        return x + y
+
+    g = add(placeholder, 2)
+    assert raises(TypeError, lambda: g.call())
+    assert raises(TypeError, lambda: g.call(placeholder))
+    assert raises(TypeError, lambda: add.call(placeholder, 2))
+    assert g.call(1) == 3
+
+
+def test_curry_placeholder_bind():
+    @curry
+    def add3(x, y, z):
+        return x + y + z
+
+    g = add3.bind(placeholder, 2)
+    assert isinstance(g, curry)
+    assert g(1, 3) == 6
+    assert add3(placeholder, 2).bind(1)(3) == 6
+
+
+def test_curry_placeholder_comparable():
+    def f(a, b, c):
+        return a, b, c
+
+    assert curry(f)(1, placeholder) == curry(f)(1, placeholder)
+    assert curry(f)(1, placeholder) != curry(f)(placeholder, 1)
+    assert hash(curry(f)(1, placeholder)) == hash(curry(f)(1, placeholder))
 
 
 def test_curry_bad_types():

@@ -17,6 +17,16 @@ def test_curry():
     assert list(f((1, 2, 3))) == list(g((1, 2, 3)))
 
 
+def test_curry_placeholder():
+    from toolz.functoolz import placeholder
+    assert pickle.loads(pickle.dumps(placeholder)) is placeholder
+
+    f = curry(map)(placeholder, [1, 2, 3])
+    g = pickle.loads(pickle.dumps(f))
+    assert list(g(str)) == ['1', '2', '3']
+    assert g == f
+
+
 def test_juxt():
     f = juxt(str, int, bool)
     g = pickle.loads(pickle.dumps(f))

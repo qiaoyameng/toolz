@@ -96,6 +96,33 @@ In this particular example it's probably simpler to stick with ``partial``.
 Once ``partial`` starts occurring several times in your code it may be time to
 switch to the ``curried`` namespace.
 
+Placeholders
+------------
+
+Sometimes the arguments we know up front are not the leading ones.  The
+``placeholder`` object (available as ``toolz.placeholder`` or
+``curry.placeholder``) explicitly marks positional arguments to be filled in
+by later calls, so we don't need to write a lambda.
+
+.. code::
+
+    >>> from toolz import curry, placeholder
+
+    >>> @curry
+    ... def f(a, b, c, d):
+    ...     return (a, b, c, d)
+
+    >>> g = f(placeholder, 2, placeholder, 4)  # fix the 2nd and 4th arguments
+    >>> g(1, 3)                                # fill the open slots in order
+    (1, 2, 3, 4)
+
+Subsequent positional arguments fill the open slots in order; extra arguments
+are appended after them.  Keyword arguments bind according to the Python
+signature, and a parameter may not be occupied both positionally and by
+keyword.  While placeholders remain unfilled, calling returns a new ``curry``
+object without invoking the function; the explicit ``call`` method raises
+``TypeError`` if any placeholder is still unfilled.
+
 The Curried Namespace
 ---------------------
 
