@@ -2,8 +2,8 @@ from collections import defaultdict as _defaultdict
 from collections.abc import Mapping
 import os
 from toolz.dicttoolz import (merge, merge_with, valmap, keymap, update_in,
-                             assoc, dissoc, keyfilter, valfilter, itemmap,
-                             itemfilter, assoc_in, get_in)
+                             update_in_many, assoc, dissoc, keyfilter,
+                             valfilter, itemmap, itemfilter, assoc_in, get_in)
 from toolz.functoolz import identity
 from toolz.utils import raises
 
@@ -142,6 +142,37 @@ class TestDict:
         update_in(d, ['x'], inc, **kw)
         assert d is oldd
 
+    def test_update_in_many(self):
+        D, kw = self.D, self.kw
+        assert update_in_many(D({"a": 0}), [(["a"], inc)], **kw) == D({"a": 1})
+        assert (update_in_many(D({"a": 0, "b": 1}),
+                               [(["a"], inc), (["b"], str)], **kw) ==
+                D({"a": 1, "b": "1"}))
+        assert (update_in_many(D({"t": 1, "v": D({"a": 0, "b": 0})}),
+                               [(["v", "a"], inc), (["v", "b"], inc),
+                                (["t"], str)], **kw) ==
+                D({"t": "1", "v": D({"a": 1, "b": 1})}))
+        # Handle missing keys, creating nested dictionaries as needed.
+        assert (update_in_many(D({}), [(["z"], inc)], 0, **kw) == D({"z": 1}))
+        assert (update_in_many(D({}), [(["z"], lambda x: x + "ar")],
+                               default="b", **kw) == D({"z": "bar"}))
+        assert (update_in_many(D({}), [([0, 1], inc), (["x"], str)],
+                               default=-1, **kw) ==
+                D({0: D({1: 0}), "x": "-1"}))
+        assert (update_in_many(D({"foo": "bar"}),
+                               [(["d", 1, 0], str), (["d", 2], inc)],
+                               20, **kw) ==
+                D({"foo": "bar", "d": D({1: D({0: "20"}), 2: 21})}))
+        # No updates still returns a copy.
+        d = D({"a": 1})
+        d2 = update_in_many(d, [], **kw)
+        assert d2 == d and d2 is not d
+        # Verify immutability:
+        d = D({'x': 1})
+        oldd = d
+        update_in_many(d, [(['x'], inc)], **kw)
+        assert d is oldd
+
     def test_factory(self):
         D, kw = self.D, self.kw
         assert merge(defaultdict(int, D({1: 2})), D({2: 3})) == {1: 2, 2: 3}
@@ -248,6 +279,108 @@ def test_environ():
     assert keymap(identity, os.environ) == os.environ
     assert valmap(identity, os.environ) == os.environ
     assert itemmap(identity, os.environ) == os.environ
+
+
+def test_update_in_many_copies_shared_ancestors_once():
+    # A factory that records how many dictionaries it constructs.
+    constructed = []
+
+    def factory():
+        d = dict()
+        constructed.append(d)
+        return d
+
+    untouched = {'v': 3}
+    d = {'a': {'b': 1, 'c': 2, 'keep': untouched}, 'other': untouched}
+    result = update_in_many(d, [(['a', 'b'], inc), (['a', 'c'], inc),
+                                (['new', 'deep'], str)],
+                            default=0, factory=factory)
+    # One copy each for the root, 'a', and the missing 'new' branch.
+    assert len(constructed) == 3
+    assert result == {'a': {'b': 2, 'c': 3, 'keep': untouched},
+                      'other': untouched, 'new': {'deep': '0'}}
+    # Untouched branches are shared, not copied.
+    assert result['other'] is untouched
+    assert result['a']['keep'] is untouched
+    assert d == {'a': {'b': 1, 'c': 2, 'keep': untouched}, 'other': untouched}
+
+
+def test_update_in_many_funcs_see_original_values():
+    seen = []
+    d = {'a': {'b': 1, 'c': 2}}
+
+    def record(x):
+        seen.append(x)
+        return x * 10
+
+    result = update_in_many(d, [(['a', 'b'], record), (['a', 'c'], record)])
+    assert sorted(seen) == [1, 2]
+    assert result == {'a': {'b': 10, 'c': 20}}
+
+
+def test_update_in_many_iterator_paths():
+    d = {'a': {'b': 1}, 'c': 2}
+    updates = ((iter(keys), func) for keys, func in
+               [(['a', 'b'], inc), (['c'], str)])
+    assert update_in_many(d, updates) == {'a': {'b': 2}, 'c': '2'}
+
+
+def test_update_in_many_conflicting_paths_rejected_before_calls():
+    calls = []
+
+    def func(x):
+        calls.append(x)
+        return x
+
+    d = {'a': {'b': 1}}
+    conflicts = [
+        [(['a', 'b'], func), (['a', 'b'], func)],      # duplicate path
+        [(['a'], func), (['a', 'b'], func)],           # ancestor first
+        [(['a', 'b'], func), (['a'], func)],           # descendant first
+        [(['a', 'b'], func), (['a', 'b', 'c'], func)], # deeper descendant
+    ]
+    for updates in conflicts:
+        assert raises(ValueError, lambda: update_in_many(d, updates))
+        assert raises(ValueError, lambda: update_in_many(d, list(updates)))
+    # Paths may be one-shot iterators and are still checked up front.
+    assert raises(ValueError,
+                  lambda: update_in_many(d, [(iter(['a']), func),
+                                             (iter(['a', 'b']), func)]))
+    assert calls == []
+    assert d == {'a': {'b': 1}}
+    # Empty paths are invalid too.
+    assert raises(ValueError, lambda: update_in_many(d, [([], func)]))
+
+
+def test_update_in_many_failing_func_leaves_no_partial_result():
+    d = {'a': {'b': 1}, 'c': 2}
+
+    def boom(x):
+        raise ZeroDivisionError('boom')
+
+    assert raises(ZeroDivisionError,
+                  lambda: update_in_many(d, [(['a', 'b'], inc),
+                                             (['c'], boom)]))
+    assert d == {'a': {'b': 1}, 'c': 2}
+
+
+def test_update_in_many_deep_paths_iterative():
+    depth = 10000  # far beyond the default recursion limit
+    keys = list(range(depth))
+    d = node = {}
+    for k in keys:
+        node[k] = {}
+        node = node[k]
+    result = update_in_many(d, [(keys + ['leaf'], inc)], default=0)
+    node = result
+    for k in keys:
+        node = node[k]
+    assert node == {'leaf': 1}
+    # The original is untouched.
+    node = d
+    for k in keys:
+        node = node[k]
+    assert node == {}
 
 
 def test_merge_with_non_dict_mappings():

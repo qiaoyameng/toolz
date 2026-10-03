@@ -96,6 +96,7 @@ take_nth = toolz.curry(toolz.take_nth)
 topk = toolz.curry(toolz.topk)
 unique = toolz.curry(toolz.unique)
 update_in = toolz.curry(toolz.update_in)
+update_in_many = toolz.curry(toolz.update_in_many)
 valfilter = toolz.curry(toolz.valfilter)
 valmap = toolz.curry(toolz.valmap)
 

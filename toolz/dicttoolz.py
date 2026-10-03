@@ -5,7 +5,8 @@ from collections.abc import Mapping
 
 __all__ = ('merge', 'merge_with', 'valmap', 'keymap', 'itemmap',
            'valfilter', 'keyfilter', 'itemfilter',
-           'assoc', 'dissoc', 'assoc_in', 'update_in', 'get_in')
+           'assoc', 'dissoc', 'assoc_in', 'update_in', 'update_in_many',
+           'get_in')
 
 
 def _get_factory(f, kwargs):
@@ -297,6 +298,100 @@ def update_in(d, keys, func, default=None, factory=dict):
         inner[k] = func(d[k])
     else:
         inner[k] = func(default)
+    return rv
+
+
+def update_in_many(d, updates, default=None, factory=dict):
+    """ Update many values in a (potentially) nested dictionary at once
+
+    inputs:
+    d - dictionary on which to operate
+    updates - iterable of (keys, func) pairs, where keys is a list, tuple,
+        or iterator giving the location of the value to be changed in d,
+        and func is the function to operate on that value
+
+    Like calling ``update_in`` once for each pair, but more efficient:
+    dictionaries that are ancestors of more than one updated value are
+    copied only once, and branches that are not touched are shared with
+    the original dictionary.
+
+    Every func receives the value found in the original dictionary d
+    (or ``default`` if its path is missing), i.e. all updates observe
+    the state before any of them is applied.
+
+    Paths must not conflict: the same path twice, or one path being a
+    prefix of another, raises ValueError before any func is called.
+
+    The original dictionary is never mutated.  If a func raises, the
+    exception propagates and no partially updated result is produced.
+
+    >>> inc = lambda x: x + 1
+    >>> update_in_many({'a': 0, 'b': {'c': 1, 'd': 2}},
+    ...                [(['a'], inc), (['b', 'c'], str)])
+    {'a': 1, 'b': {'c': '1', 'd': 2}}
+
+    >>> update_in_many({}, [([1, 2], str), (['x'], inc)], default=0)
+    {1: {2: '0'}, 'x': 1}
+
+    See Also:
+        update_in
+    """
+    # Build a trie of the updates.  Each node is [func, children] where
+    # func is None for purely intermediate nodes.  Materializing the
+    # paths here consumes one-shot iterators exactly once and detects
+    # conflicts before any func is called.
+    root = [None, {}]
+    for keys, func in updates:
+        node = root
+        depth = 0
+        for k in keys:
+            if node[0] is not None:
+                raise ValueError("update_in_many got conflicting paths: "
+                                 "one path is a prefix of another")
+            node = node[1].setdefault(k, [None, {}])
+            depth += 1
+        if depth == 0:
+            raise ValueError("update_in_many got an empty path")
+        if node[0] is not None:
+            raise ValueError("update_in_many got conflicting paths: "
+                             "duplicate path")
+        if node[1]:
+            raise ValueError("update_in_many got conflicting paths: "
+                             "one path is a prefix of another")
+        node[0] = func
+
+    # Copy d and, top-down, every node on the way to an updated value.
+    # Iterative so that deep paths don't hit the recursion limit.
+    rv = factory()
+    rv.update(d)
+    leaves = []
+    stack = [(d, rv, root)]
+    empty = {}
+    while stack:
+        old, new, trie = stack.pop()
+        for k, child in trie[1].items():
+            if k in old:
+                child_old = old[k]
+                present = True
+            else:
+                child_old = empty
+                present = False
+            if child[1]:
+                child_new = factory()
+                child_new.update(child_old)
+                new[k] = child_new
+                stack.append((child_old, child_new, child))
+            else:
+                leaves.append((new, k, child[0], present, child_old))
+
+    # Apply the update functions last: every func sees the original
+    # values, and a failing func leaves d untouched with no partial
+    # result escaping.
+    for new, k, func, present, old_value in leaves:
+        if present:
+            new[k] = func(old_value)
+        else:
+            new[k] = func(default)
     return rv
 
 
