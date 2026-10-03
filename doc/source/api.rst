@@ -56,6 +56,7 @@ Functoolz
    apply
    complement
    compose
+   compose_async
    compose_left
    curry
    do

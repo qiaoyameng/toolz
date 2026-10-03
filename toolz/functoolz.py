@@ -12,8 +12,8 @@ if sys.version_info >= (3, 14):
 
 
 __all__ = ('identity', 'apply', 'thread_first', 'thread_last', 'memoize',
-           'compose', 'compose_left', 'pipe', 'complement', 'juxt', 'do',
-           'curry', 'flip', 'excepts')
+           'compose', 'compose_left', 'compose_async', 'pipe', 'complement',
+           'juxt', 'do', 'curry', 'flip', 'excepts')
 
 PYPY = hasattr(sys, 'pypy_version_info')
 
@@ -568,7 +568,7 @@ class Compose:
     @instanceproperty
     def __signature__(self):
         base = inspect.signature(self.first)
-        last = inspect.signature(self.funcs[-1])
+        last = inspect.signature(self.funcs[-1] if self.funcs else self.first)
         return base.replace(return_annotation=last.return_annotation)
 
     __wrapped__ = instanceproperty(attrgetter('first'))
@@ -649,6 +649,33 @@ class Compose:
         __annotate__ = instanceproperty(_get_annotate)
 
 
+class ComposeAsync(Compose):
+    """ An async composition of functions
+
+    See Also:
+        compose_async
+    """
+    __slots__ = ()
+
+    async def __call__(self, *args, **kwargs):
+        # Each stage is called at most once, and only after the previous
+        # stage has completed: a stage that raises or is cancelled (while
+        # being awaited) prevents all later stages from being called, so
+        # no coroutine is ever created that will not be awaited.  Awaiting
+        # happens inline in this single coroutine, so the caller's
+        # context (including contextvars) spans the whole execution, and
+        # instances hold no per-call state and may be shared by any
+        # number of concurrent executions.
+        ret = self.first(*args, **kwargs)
+        if inspect.isawaitable(ret):
+            ret = await ret
+        for f in self.funcs:
+            ret = f(ret)
+            if inspect.isawaitable(ret):
+                ret = await ret
+        return ret
+
+
 def compose(*funcs):
     """ Compose functions to operate in series.
 
@@ -694,6 +721,51 @@ def compose_left(*funcs):
         pipe
     """
     return compose(*reversed(funcs))
+
+
+async def _async_identity(x):
+    """ Async identity function.  Await and return x
+
+    >>> import asyncio
+    >>> asyncio.run(_async_identity(3))
+    3
+    """
+    return x
+
+
+def compose_async(*funcs):
+    """ Compose functions into an async callable, applied in series.
+
+    Like ``compose``, functions are applied from right to left so that
+    ``compose_async(f, g, h)(x, y)`` awaits the equivalent of
+    ``f(g(h(x, y)))``, passing each stage's single result to the next.
+
+    Stages may be plain functions, async functions, callable objects, or
+    functions returning any awaitable (coroutines, futures, or objects
+    with ``__await__``); a stage's result is awaited only when it is
+    awaitable.  The returned object is always an async callable, even
+    when every stage is synchronous.
+
+    Each stage is called at most once, and only after the previous stage
+    has completed: if a stage raises or the call is cancelled, later
+    stages are never started.  The caller's context (including
+    contextvars) spans the whole execution, and the composed object is
+    stateless, so it may be shared by concurrent executions.
+
+    If no arguments are provided, an async identity function is returned.
+
+    >>> import asyncio
+    >>> async def inc(x): return x + 1
+    >>> asyncio.run(compose_async(str, inc)(3))
+    '4'
+
+    See Also:
+        compose
+        compose_left
+    """
+    if not funcs:
+        return _async_identity
+    return ComposeAsync(funcs)
 
 
 def pipe(data, *funcs):
