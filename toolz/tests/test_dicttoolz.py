@@ -2,8 +2,8 @@ from collections import defaultdict as _defaultdict
 from collections.abc import Mapping
 import os
 from toolz.dicttoolz import (merge, merge_with, valmap, keymap, update_in,
-                             assoc, dissoc, keyfilter, valfilter, itemmap,
-                             itemfilter, assoc_in, get_in)
+                             update_in_multi, assoc, dissoc, keyfilter,
+                             valfilter, itemmap, itemfilter, assoc_in, get_in)
 from toolz.functoolz import identity
 from toolz.utils import raises
 
@@ -141,6 +141,33 @@ class TestDict:
         oldd = d
         update_in(d, ['x'], inc, **kw)
         assert d is oldd
+
+    def test_update_in_multi(self):
+        D, kw = self.D, self.kw
+        assert update_in_multi(
+            D({"a": 0, "b": 2}),
+            [(["a"], inc), (["b"], inc)],
+            **kw,
+        ) == D({"a": 1, "b": 3})
+
+        assert update_in_multi(
+            D({"v": D({"a": 0, "b": 1})}),
+            [(["v", "a"], inc), (["v", "b"], str)],
+            **kw,
+        ) == D({"v": D({"a": 1, "b": "1"})})
+
+        assert update_in_multi(
+            D({}),
+            [(["a", "b"], inc), (["a", "c"], inc)],
+            default=0,
+            **kw,
+        ) == D({"a": D({"b": 1, "c": 1})})
+
+        assert update_in_multi(
+            D({}),
+            [(["a"], inc, 0), (["b"], str, None)],
+            **kw,
+        ) == D({"a": 1, "b": "None"})
 
     def test_factory(self):
         D, kw = self.D, self.kw
@@ -297,3 +324,179 @@ def test_dissoc_agrees_on_both_sides_of_its_size_heuristic():
     assert dissoc(d, "1", "2") == {k: v for k, v in d.items() if k not in ("1", "2")}
     assert dissoc(d, *[str(i) for i in range(9)]) == {"9": 9}
     assert dissoc(d) == d
+
+
+def test_update_in_multi_copies_shared_ancestors_once():
+    untouched_leaf = {"z": 3}
+    shared = {"x": {"value": 1}, "y": {"value": 2}, "z": untouched_leaf}
+    original = {"a": shared, "u": untouched_leaf}
+    constructions = []
+
+    def factory():
+        created = {}
+        constructions.append(created)
+        return created
+
+    result = update_in_multi(
+        original,
+        [
+            (["a", "x", "value"], inc),
+            (["a", "y", "value"], inc),
+        ],
+        factory=factory,
+    )
+
+    assert result == {
+        "a": {
+            "x": {"value": 2},
+            "y": {"value": 3},
+            "z": {"z": 3},
+        },
+        "u": untouched_leaf,
+    }
+    assert len(constructions) == 4
+    assert result["a"]["z"] is untouched_leaf
+    assert result["u"] is untouched_leaf
+    assert result["a"] is not original["a"]
+    assert result["a"]["x"] is not original["a"]["x"]
+    assert result["a"]["y"] is not original["a"]["y"]
+
+
+def test_update_in_multi_copies_missing_shared_ancestor_once():
+    constructions = []
+
+    def factory():
+        created = {}
+        constructions.append(created)
+        return created
+
+    result = update_in_multi(
+        {},
+        [(["a", "x"], inc), (["a", "y"], inc)],
+        default=0,
+        factory=factory,
+    )
+
+    assert result == {"a": {"x": 1, "y": 1}}
+    assert len(constructions) == 2
+
+
+def test_update_in_multi_functions_observe_original_values():
+    data = {"shared": {"a": 1, "b": 2}}
+    observed = []
+
+    def mutate_then_record(value):
+        data["shared"]["b"] = 100
+        observed.append(value)
+        return value
+
+    result = update_in_multi(
+        data,
+        [
+            (["shared", "a"], mutate_then_record),
+            (["shared", "b"], lambda value: observed.append(value) or value),
+        ],
+    )
+
+    assert result == {"shared": {"a": 1, "b": 2}}
+    assert observed == [1, 2]
+
+
+def test_update_in_multi_consumes_single_pass_path_iterators():
+    def one_pass_path():
+        yield "a"
+        yield "b"
+
+    assert update_in_multi(
+        {"a": {"b": 1}},
+        [(one_pass_path(), inc)],
+    ) == {"a": {"b": 2}}
+
+
+def test_update_in_multi_rejects_conflicts_before_calling_functions():
+    called = []
+
+    def record(label):
+        def update(value):
+            called.append(label)
+            return value
+        return update
+
+    conflicting_updates = [
+        [(["a"], record("same")), (["a"], record("same"))],
+        [
+            (["a"], record("ancestor")),
+            (["a", "b"], record("descendant")),
+        ],
+        [
+            (["a", "b"], record("descendant")),
+            (["a"], record("ancestor")),
+        ],
+    ]
+
+    for updates in conflicting_updates:
+        called.clear()
+        assert raises(ValueError, lambda: update_in_multi({}, updates))
+        assert called == []
+
+
+def test_update_in_multi_function_failure_leaves_original_unchanged():
+    untouched_leaf = {"z": 3}
+    original = {"a": {"x": 1, "y": 2}, "u": untouched_leaf}
+    factory_inputs = []
+
+    class PartialResult(Exception):
+        pass
+
+    def fail(value):
+        raise PartialResult
+
+    def factory():
+        created = {}
+        factory_inputs.append(created)
+        return created
+
+    assert raises(
+        PartialResult,
+        lambda: update_in_multi(
+            original,
+            [(["a", "x"], inc), (["a", "y"], fail)],
+            factory=factory,
+        ),
+    )
+
+    assert original == {"a": {"x": 1, "y": 2}, "u": untouched_leaf}
+    assert original["u"] is untouched_leaf
+    assert factory_inputs == []
+
+
+def test_update_in_multi_invalid_existing_path_fails_before_functions():
+    called = []
+
+    assert raises(
+        TypeError,
+        lambda: update_in_multi(
+            {"a": 1},
+            [
+                (["a", "b"], lambda value: called.append(value) or value),
+                (["c"], lambda value: called.append(value) or value),
+            ],
+        ),
+    )
+    assert called == []
+
+
+def test_update_in_multi_deep_path_does_not_recurse():
+    depth = 3000
+    keys = [str(i) for i in range(depth)]
+    original = {}
+    node = original
+    for key in keys[:-1]:
+        node[key] = {}
+        node = node[key]
+    node[keys[-1]] = 1
+
+    result = update_in_multi(original, [(keys, inc)])
+
+    assert get_in(keys, result) == 2
+    assert get_in(keys, original) == 1

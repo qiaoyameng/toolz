@@ -5,7 +5,11 @@ from collections.abc import Mapping
 
 __all__ = ('merge', 'merge_with', 'valmap', 'keymap', 'itemmap',
            'valfilter', 'keyfilter', 'itemfilter',
-           'assoc', 'dissoc', 'assoc_in', 'update_in', 'get_in')
+           'assoc', 'dissoc', 'assoc_in', 'update_in',
+           'update_in_multi', 'get_in')
+
+
+_TERMINAL = object()
 
 
 def _get_factory(f, kwargs):
@@ -298,6 +302,114 @@ def update_in(d, keys, func, default=None, factory=dict):
     else:
         inner[k] = func(default)
     return rv
+
+
+def update_in_multi(d, updates, default=None, factory=dict):
+    """ Update multiple values in a (potentially nested) dictionary
+
+    ``updates`` is an iterable of ``(keys, func)`` pairs. Each ``keys`` is a
+    path through nested mappings, and ``func`` is called with the value at
+    that path before any update is applied. A third item may optionally
+    provide the default used for that individual update.
+
+    Paths must be pairwise disjoint. Repeated paths and ancestor/descendant
+    pairs raise ``ValueError`` before any function is called. Mappings on
+    shared paths are copied only once; untouched branches continue to refer
+    to the original objects.
+
+    >>> inc = lambda x: x + 1
+    >>> update_in_multi({'a': 0, 'b': 2}, [(['a'], inc), (['b'], inc)])
+    {'a': 1, 'b': 3}
+    >>> update_in_multi({}, [(['a', 'b'], inc)], default=0)
+    {'a': {'b': 1}}
+    """
+    operations = []
+    trie = {}
+
+    for update in updates:
+        try:
+            if len(update) == 2:
+                keys, func = update
+                update_default = default
+            elif len(update) == 3:
+                keys, func, update_default = update
+            else:
+                raise ValueError("each update must contain keys and a "
+                                 "function, and optionally a default")
+        except TypeError as e:
+            raise ValueError("each update must be a sequence of keys, a "
+                             "function, and optionally a default") from e
+
+        if not callable(func):
+            raise TypeError("update function is not callable")
+
+        path = tuple(keys)
+        if not path:
+            raise ValueError("update path must not be empty")
+
+        node = trie
+        for key in path:
+            if _TERMINAL in node:
+                raise ValueError("conflicting update paths: {} is an "
+                                 "ancestor of {}".format(
+                                     node[_TERMINAL]['path'], path))
+            child = node.get(key)
+            if child is None:
+                child = {}
+                node[key] = child
+            node = child
+
+        if _TERMINAL in node:
+            raise ValueError("conflicting update paths: {} appears more "
+                             "than once".format(path))
+        if node:
+            existing_path = next(iter(node.values()))[_TERMINAL]['path']
+            raise ValueError("conflicting update paths: {} is an ancestor "
+                             "of {}".format(path, existing_path))
+
+        operation = {
+            'path': path,
+            'func': func,
+            'default': update_default,
+        }
+        node[_TERMINAL] = operation
+        operations.append(operation)
+
+    for operation in operations:
+        current = d
+        found = True
+        for key in operation['path']:
+            if key in current:
+                current = current[key]
+            else:
+                found = False
+                break
+
+        operation['old'] = current if found else operation['default']
+
+    for operation in operations:
+        operation['new'] = operation['func'](operation['old'])
+
+    result = factory()
+    stack = [(trie, d, result, True)]
+
+    while stack:
+        trie_node, old_node, new_node, old_exists = stack.pop()
+        if old_exists:
+            new_node.update(old_node)
+
+        for key, child_node in trie_node.items():
+            if _TERMINAL in child_node:
+                new_node[key] = child_node[_TERMINAL]['new']
+                continue
+
+            child_exists = old_exists and key in old_node
+            old_child = old_node[key] if child_exists else None
+            new_child = factory()
+            new_node[key] = new_child
+            stack.append((child_node, old_child, new_child, child_exists))
+
+    return result
 
 
 def get_in(keys, coll, default=None, no_default=False):

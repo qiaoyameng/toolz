@@ -85,6 +85,7 @@ Dicttoolz
    merge
    merge_with
    update_in
+   update_in_multi
    valfilter
    valmap
 
