@@ -49,6 +49,9 @@ from toolz import (
     merge_sorted,
     peek,
     pipe,
+    Reduced,
+    is_reduced,
+    reduced,
     second,
     thread_first,
     thread_last,
@@ -94,6 +97,7 @@ tail = toolz.curry(toolz.tail)
 take = toolz.curry(toolz.take)
 take_nth = toolz.curry(toolz.take_nth)
 topk = toolz.curry(toolz.topk)
+transduce = toolz.curry(toolz.transduce)
 unique = toolz.curry(toolz.unique)
 update_in = toolz.curry(toolz.update_in)
 valfilter = toolz.curry(toolz.valfilter)

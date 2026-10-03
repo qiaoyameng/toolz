@@ -97,6 +97,22 @@ Recipes
    countby
    partitionby
 
+Transducers
+-----------
+
+.. currentmodule:: toolz.transducers
+
+.. autosummary::
+   Reduced
+   compose
+   filter
+   is_reduced
+   map
+   partition
+   reduced
+   take
+   transduce
+
 Sandbox
 -------
 
@@ -121,6 +137,9 @@ Definitions
    :members:
 
 .. automodule:: toolz.dicttoolz
+   :members:
+
+.. automodule:: toolz.transducers
    :members:
 
 .. automodule:: toolz.sandbox.core

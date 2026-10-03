@@ -8,6 +8,8 @@ from .recipes import *
 
 from functools import partial, reduce
 
+from .transducers import Reduced, is_reduced, reduced, transduce
+
 sorted = sorted
 
 map = map
