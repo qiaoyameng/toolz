@@ -12,8 +12,8 @@ if sys.version_info >= (3, 14):
 
 
 __all__ = ('identity', 'apply', 'thread_first', 'thread_last', 'memoize',
-           'compose', 'compose_left', 'pipe', 'complement', 'juxt', 'do',
-           'curry', 'flip', 'excepts')
+           'compose', 'compose_left', 'compose_async', 'pipe', 'complement',
+           'juxt', 'do', 'curry', 'flip', 'excepts')
 
 PYPY = hasattr(sys, 'pypy_version_info')
 
@@ -694,6 +694,147 @@ def compose_left(*funcs):
         pipe
     """
     return compose(*reversed(funcs))
+
+
+async def _async_identity(x):
+    """ Async identity function.  Return x
+
+    >>> import asyncio
+    >>> asyncio.run(_async_identity(3))
+    3
+    """
+    return x
+
+
+class ComposeAsync:
+    """ An async composition of functions
+
+    See Also:
+        compose_async
+    """
+    __slots__ = 'first', 'funcs'
+
+    def __init__(self, funcs):
+        funcs = tuple(reversed(funcs))
+        self.first = funcs[0]
+        self.funcs = funcs[1:]
+
+    async def __call__(self, *args, **kwargs):
+        # Every stage runs in this single coroutine, so the caller's
+        # context (e.g. contextvars) is preserved throughout, a failing
+        # or cancelled stage prevents later stages from starting, and
+        # concurrent calls share no per-request state.
+        ret = self.first(*args, **kwargs)
+        if inspect.isawaitable(ret):
+            ret = await ret
+        for f in self.funcs:
+            ret = f(ret)
+            if inspect.isawaitable(ret):
+                ret = await ret
+        return ret
+
+    def __getstate__(self):
+        return self.first, self.funcs
+
+    def __setstate__(self, state):
+        self.first, self.funcs = state
+
+    @instanceproperty(classval=__doc__)
+    def __doc__(self):
+        def composed_doc(*fs):
+            """Generate a docstring for the composition of fs.
+            """
+            if not fs:
+                # Argument name for the docstring.
+                return '*args, **kwargs'
+
+            return f'{fs[0].__name__}({composed_doc(*fs[1:])})'
+
+        try:
+            return (
+                'lambda *args, **kwargs: ' +
+                composed_doc(*reversed((self.first,) + self.funcs))
+            )
+        except AttributeError:
+            # One of our callables does not have a `__name__`, whatever.
+            return 'A composition of functions'
+
+    @property
+    def __name__(self):
+        try:
+            return '_of_'.join(
+                f.__name__ for f in reversed((self.first,) + self.funcs)
+            )
+        except AttributeError:
+            return type(self).__name__
+
+    def __repr__(self):
+        return '{.__class__.__name__}{!r}'.format(
+            self, tuple(reversed((self.first, ) + self.funcs)))
+
+    def __eq__(self, other):
+        if isinstance(other, ComposeAsync):
+            return other.first == self.first and other.funcs == self.funcs
+        return NotImplemented
+
+    def __ne__(self, other):
+        equality = self.__eq__(other)
+        return NotImplemented if equality is NotImplemented else not equality
+
+    def __hash__(self):
+        return hash(self.first) ^ hash(self.funcs)
+
+    # Mimic the descriptor behavior of python functions.
+    # i.e. let ComposeAsync be called as a method when bound to a class.
+    def __get__(self, obj, objtype=None):
+        return self if obj is None else MethodType(self, obj)
+
+    @instanceproperty
+    def __signature__(self):
+        base = inspect.signature(self.first)
+        last = self.funcs[-1] if self.funcs else self.first
+        return base.replace(
+            return_annotation=inspect.signature(last).return_annotation)
+
+    __wrapped__ = instanceproperty(attrgetter('first'))
+
+
+def compose_async(*funcs):
+    """ Compose functions into an async callable applied in series.
+
+    Like ``compose``, functions are applied from right to left so that
+    ``compose_async(f, g, h)(x, y)`` is the same as ``f(g(h(x, y)))``.
+
+    The result is always an async callable: calling it returns a coroutine
+    that must be awaited.  Each stage may be a plain function, an async
+    function, or any callable returning an awaitable (e.g. a coroutine, a
+    future, or an object defining ``__await__``); awaitable results are
+    awaited before being passed on, so ``inspect.iscoroutinefunction`` is
+    never needed to decide whether to wait.  Each stage is called at most
+    once, and a stage that raises or is cancelled prevents later stages
+    from starting.  All stages run in a single coroutine, so the caller's
+    ``contextvars`` context spans the whole execution, and the composed
+    object keeps no per-call state, so it may serve many requests
+    concurrently.
+
+    If no arguments are provided, an async identity function is returned.
+    Unlike ``compose``, a single function is wrapped too, so the result is
+    always an async callable.
+
+    >>> import asyncio
+    >>> async def ainc(x):
+    ...     return x + 1
+    >>> composed = compose_async(str, ainc, lambda i: i + 1)
+    >>> asyncio.run(composed(3))
+    '5'
+
+    See Also:
+        compose
+        compose_left
+    """
+    if not funcs:
+        return _async_identity
+    return ComposeAsync(funcs)
 
 
 def pipe(data, *funcs):

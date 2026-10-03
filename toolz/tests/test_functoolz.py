@@ -1,12 +1,16 @@
+import asyncio
+import contextvars
 import functools
+import gc
 import inspect
 import sys
 import typing
 import pytest
 import toolz
 from toolz.functoolz import (thread_first, thread_last, memoize, curry,
-                             compose, compose_left, pipe, complement, do, juxt,
-                             flip, excepts, apply, Compose)
+                             compose, compose_left, compose_async, pipe,
+                             complement, do, juxt,
+                             flip, excepts, apply, Compose, ComposeAsync)
 from operator import add, mul, itemgetter
 from toolz.utils import raises
 from functools import partial
@@ -784,6 +788,273 @@ def test_compose_annotations_formats():
 
     assert annotationlib.get_annotations(Compose) == {}
     assert annotationlib.get_annotations(Compose, format=Format.STRING) == {}
+
+
+class MultiplyBy:
+    """Callable object (not a coroutine function) returning a coroutine."""
+
+    def __init__(self, factor):
+        self.factor = factor
+
+    def __call__(self, x):
+        return self._multiply(x)
+
+    async def _multiply(self, x):
+        return x * self.factor
+
+
+class CustomAwaitable:
+    """Custom awaitable that is neither a coroutine nor a future."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __await__(self):
+        if False:
+            yield None
+        return self.value
+
+
+def test_compose_async():
+    def returns_awaitable(x):
+        return CustomAwaitable(x + 1)
+
+    async def ainc(x):
+        return x + 1
+
+    # plain functions, async functions, callable objects, and plain
+    # functions returning custom awaitables, all in one chain
+    composed = compose_async(str, MultiplyBy(2), returns_awaitable, ainc, inc)
+    coro = composed(0)
+    assert inspect.iscoroutine(coro)
+    assert asyncio.run(coro) == '6'
+
+    # keyword and multiple arguments go to the first stage
+    async def aadd(x, y=0):
+        return x + y
+
+    assert asyncio.run(compose_async(str, aadd)(1, y=2)) == '3'
+
+    # a stage may also return an asyncio.Future
+    async def with_future():
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        loop.call_soon(fut.set_result, 40)
+
+        def make_future(x):
+            return fut
+
+        return await compose_async(inc, make_future)(0)
+
+    assert asyncio.run(with_future()) == 41
+
+
+def test_compose_async_empty():
+    composed = compose_async()
+    assert inspect.iscoroutinefunction(composed)
+    assert asyncio.run(composed(3)) == 3
+
+
+def test_compose_async_single_function_is_wrapped():
+    # unlike compose, even one sync function gives an async callable
+    composed = compose_async(inc)
+    assert isinstance(composed, ComposeAsync)
+    coro = composed(1)
+    assert inspect.iscoroutine(coro)
+    assert asyncio.run(coro) == 2
+
+
+def test_compose_async_metadata():
+    def f(a):
+        return a
+
+    def g(a):
+        return a
+
+    composed = compose_async(f, g)
+    assert composed.__name__ == 'f_of_g'
+    assert composed.__doc__ == 'lambda *args, **kwargs: f(g(*args, **kwargs))'
+
+    # Create an object with no __name__.
+    h = object()
+
+    composed = compose_async(f, h)
+    assert composed.__name__ == 'ComposeAsync'
+    assert composed.__doc__ == 'A composition of functions'
+
+    assert repr(composed) == f'ComposeAsync({f!r}, {h!r})'
+
+    assert composed == compose_async(f, h)
+    assert composed == AlwaysEquals()
+    assert not composed == compose_async(h, f)
+    assert not composed == compose(f, h)
+    assert not composed == object()
+    assert not composed == NeverEquals()
+
+    assert composed != compose_async(h, f)
+    assert composed != compose(f, h)
+    assert not composed != compose_async(f, h)
+
+    assert hash(composed) == hash(compose_async(f, h))
+    assert hash(composed) != hash(compose_async(h, f))
+
+    assert compose_async(f, h).__wrapped__ is h
+
+    bindable = compose_async(str, lambda x: x * 2, lambda x, y=0: int(x) + y)
+
+    class MyClass:
+
+        def __int__(self):
+            return 8
+
+        my_method = bindable
+        my_static_method = staticmethod(bindable)
+
+    assert asyncio.run(MyClass.my_method(3)) == '6'
+    assert asyncio.run(MyClass.my_method(3, y=2)) == '10'
+    assert asyncio.run(MyClass.my_static_method(2)) == '4'
+    assert asyncio.run(MyClass().my_method()) == '16'
+    assert asyncio.run(MyClass().my_method(y=3)) == '22'
+    assert asyncio.run(MyClass().my_static_method(0)) == '0'
+
+
+def test_compose_async_signature():
+    async def first(a: int, b: str = 'x', *args, **kwargs) -> int:
+        return a
+
+    def last(x) -> str:
+        return str(x)
+
+    composed = compose_async(last, first)
+    sig = inspect.signature(composed)
+    assert sig.parameters == inspect.signature(first).parameters
+    assert sig.return_annotation is str
+
+    # a single wrapped function still provides its own signature
+    single = compose_async(last)
+    assert inspect.signature(single).return_annotation is str
+
+    class MyClass:
+        method = composed
+
+    assert len(inspect.signature(MyClass().method).parameters) == 3
+
+
+def test_compose_async_exception_stops_chain():
+    calls = []
+
+    def first(x):
+        calls.append('first')
+        return x
+
+    async def second(x):
+        calls.append('second')
+        raise ValueError('boom')
+
+    def third(x):
+        calls.append('third')
+        return x
+
+    composed = compose_async(third, second, first)
+    with pytest.raises(ValueError, match='boom'):
+        asyncio.run(composed(0))
+    # each stage ran at most once, and nothing ran after the failure
+    assert calls == ['first', 'second']
+
+    # same when a plain function raises synchronously
+    calls.clear()
+
+    def raising(x):
+        calls.append('raising')
+        raise KeyError('nope')
+
+    with pytest.raises(KeyError):
+        asyncio.run(compose_async(third, raising, first)(0))
+    assert calls == ['first', 'raising']
+
+
+def test_compose_async_cancel_stops_chain():
+    async def main():
+        loop = asyncio.get_running_loop()
+        gate = loop.create_future()
+        entered = loop.create_future()
+        calls = []
+
+        def first(x):
+            calls.append('first')
+            return x + 1
+
+        async def second(x):
+            calls.append('second')
+            entered.set_result(x)
+            return await gate
+
+        def third(x):
+            calls.append('third')
+            return x
+
+        composed = compose_async(third, second, first)
+        task = asyncio.ensure_future(composed(1))
+        # the chain is suspended on the controlled future in stage two
+        assert await entered == 2
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # later stages never started, and the in-flight future was cancelled
+        assert calls == ['first', 'second']
+        assert gate.cancelled()
+
+    asyncio.run(main())
+    # force finalization here so a leaked coroutine would fail this test
+    # ("coroutine was never awaited" is an error under -W error)
+    gc.collect()
+
+
+def test_compose_async_contextvars():
+    var = contextvars.ContextVar('var')
+    seen = []
+
+    def first(x):
+        seen.append(var.get())
+        var.set('inner')
+        return x
+
+    async def second(x):
+        seen.append(var.get())
+        return x
+
+    async def main():
+        var.set('outer')
+        return await compose_async(second, first)(0)
+
+    assert asyncio.run(main()) == 0
+    # the caller's context reached every stage, and mutations propagate
+    assert seen == ['outer', 'inner']
+
+
+def test_compose_async_concurrent():
+    async def main():
+        loop = asyncio.get_running_loop()
+        gates = {}
+
+        def first(x):
+            gate = loop.create_future()
+            gates[x] = gate
+            return gate
+
+        async def second(x):
+            return x * 10
+
+        composed = compose_async(second, first)
+        tasks = [asyncio.ensure_future(composed(i)) for i in range(3)]
+        while len(gates) < 3:
+            await asyncio.sleep(0)
+        # resolve out of order; each request must get its own result
+        for x in reversed(range(3)):
+            gates[x].set_result(x + 1)
+        return [await task for task in tasks]
+
+    assert asyncio.run(main()) == [10, 20, 30]
 
 
 def generate_compose_left_test_cases():

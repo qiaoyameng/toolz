@@ -11,6 +11,14 @@ def test_compose():
     assert f((1, 2)) == g((1, 2))
 
 
+def test_compose_async():
+    import asyncio
+    f = compose_async(str, sum)
+    g = pickle.loads(pickle.dumps(f))
+    assert asyncio.run(f((1, 2))) == asyncio.run(g((1, 2)))
+    assert f == g
+
+
 def test_curry():
     f = curry(map)(str)
     g = pickle.loads(pickle.dumps(f))

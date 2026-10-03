@@ -592,6 +592,8 @@ module_info['toolz'] = dict(
 module_info['toolz.functoolz'] = dict(
     Compose=[
         (0, lambda funcs: None)],
+    ComposeAsync=[
+        (0, lambda funcs: None)],
     InstanceProperty=[
         (0, lambda fget=None, fset=None, fdel=None, doc=None,
             classval=None: None)],
