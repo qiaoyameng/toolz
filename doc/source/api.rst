@@ -107,6 +107,23 @@ Sandbox
    core.EqualityHashKey
    core.unzip
 
+Transducers
+-----------
+
+.. currentmodule:: toolz.transducers
+
+.. autosummary::
+   Reduced
+   reduced
+   is_reduced
+   XForm
+   mapping
+   filtering
+   partitioning
+   taking
+   compose
+   transduce
+
 
 Definitions
 -----------
@@ -127,4 +144,7 @@ Definitions
    :members:
 
 .. automodule:: toolz.sandbox.parallel
+   :members:
+
+.. automodule:: toolz.transducers
    :members:
