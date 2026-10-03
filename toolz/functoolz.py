@@ -13,7 +13,7 @@ if sys.version_info >= (3, 14):
 
 __all__ = ('identity', 'apply', 'thread_first', 'thread_last', 'memoize',
            'compose', 'compose_left', 'pipe', 'complement', 'juxt', 'do',
-           'curry', 'flip', 'excepts')
+           'curry', 'flip', 'excepts', '_', 'placeholder')
 
 PYPY = hasattr(sys, 'pypy_version_info')
 
@@ -166,6 +166,48 @@ class InstanceProperty(property):
         return InstanceProperty, state
 
 
+class _PlaceholderType:
+    """ Explicit placeholder for a deferred positional or keyword argument.
+
+    Use the singleton ``_`` (or its alias ``placeholder``) to reserve a
+    position when currying.  Later calls fill the reserved slots in order.
+
+    >>> def f(a, b, c, d):
+    ...     return (a, b, c, d)
+    >>> g = curry(f)(_, 2, _, 4)
+    >>> g(1, 3)
+    (1, 2, 3, 4)
+
+    Positional arguments fill the empty slots from left to right; keyword
+    arguments bind through the function's signature and may fill a slot by
+    name.  Binding the same parameter twice is an error.
+
+    While slots remain unfilled, calling the curry returns a new curry; use
+    ``call`` to force evaluation (it raises ``TypeError`` on unfilled slots).
+
+    >>> g = curry(f)(_, 2, _, 4)
+    >>> g.call(1, 3)
+    (1, 2, 3, 4)
+    """
+    __slots__ = ()
+
+    def __repr__(self):
+        return '_'
+
+    def __reduce__(self):
+        return (_get_placeholder, ())
+
+
+def _get_placeholder():
+    return _
+
+
+#: Singleton placeholder used to leave an argument slot open when currying.
+_ = _PlaceholderType()
+#: Descriptive alias for :data:`_`.
+placeholder = _
+
+
 class curry:
     """ Curry a callable function
 
@@ -190,6 +232,34 @@ class curry:
     >>> add(2, 3)
     5
 
+    The placeholder ``_`` leaves an argument slot open.  Later positional
+    arguments fill the open slots in order; any extra positional arguments
+    are appended after them.
+
+    >>> def report(a, b, c, d):
+    ...     return (a, b, c, d)
+    >>> g = curry(report)(_, 2, _, 4)
+    >>> g(1, 3)
+    (1, 2, 3, 4)
+    >>> g(1, 3, 5)
+    (1, 2, 3, 4, 5)
+
+    Keyword arguments bind through the Python signature and can close a slot
+    by name, but the same parameter can never be bound twice.
+
+    >>> h = curry(report)(_, 2, _, 4)
+    >>> h(1, c=3)
+    (1, 2, 3, 4)
+    >>> h(3, a=1)
+    Traceback (most recent call last):
+    ...
+    TypeError: ...
+
+    As long as slots remain open, calling returns a new curry object.
+
+    >>> type(g(1)) is curry
+    True
+
     See Also:
         toolz.curried - namespace of curried functions
                         https://toolz.readthedocs.io/en/latest/curry.html
@@ -208,29 +278,32 @@ class curry:
             and hasattr(func, 'keywords')
             and isinstance(func.args, tuple)
         ):
-            _kwargs = {}
+            merged_kwargs = {}
             if func.keywords:
-                _kwargs.update(func.keywords)
-            _kwargs.update(kwargs)
-            kwargs = _kwargs
+                merged_kwargs.update(func.keywords)
+            merged_kwargs.update(kwargs)
+            kwargs = merged_kwargs
             args = func.args + args
             func = func.func
 
-        if kwargs:
-            self._partial = partial(func, *args, **kwargs)
-        else:
-            self._partial = partial(func, *args)
+        self._curry_func = func
+        self._curry_args = args
+        self._curry_keywords = kwargs
+        self._sigspec = None
+        self._has_unknown_args = None
+        self._has_holes = any(arg is _ for arg in args) or any(
+            value is _ for value in kwargs.values())
+        if self._has_holes:
+            self._validate_holes()
 
         self.__doc__ = getattr(func, '__doc__', None)
         self.__name__ = getattr(func, '__name__', '<curry>')
         self.__module__ = getattr(func, '__module__', None)
         self.__qualname__ = getattr(func, '__qualname__', None)
-        self._sigspec = None
-        self._has_unknown_args = None
 
     @instanceproperty
     def func(self):
-        return self._partial.func
+        return self._curry_func
 
     @instanceproperty
     def __signature__(self):
@@ -241,30 +314,59 @@ class curry:
             raise TypeError('curry object has incorrect arguments')
 
         params = list(sig.parameters.values())
-        skip = 0
-        for param in params[:len(args)]:
-            if param.kind == param.VAR_POSITIONAL:
+
+        # Walk the stored positional pattern in lockstep with the
+        # signature's positional parameters.  Concrete values that precede
+        # any open slot are consumed; an open slot keeps its parameter, so
+        # the remaining signature still asks for it.  Parameters fixed by
+        # later concrete values are exposed as keyword-only.
+        param_index = 0
+        keep_from = None
+        forced_kwonly = {}
+        for i, value in enumerate(args):
+            while (param_index < len(params)
+                   and params[param_index].kind not in
+                   (inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.VAR_POSITIONAL)):
+                param_index += 1
+            if param_index >= len(params):
                 break
-            skip += 1
+            param = params[param_index]
+            if param.kind == inspect.Parameter.VAR_POSITIONAL:
+                keep_from = param_index
+                break
+            if value is _:
+                if keep_from is None:
+                    keep_from = param_index
+            elif param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD:
+                forced_kwonly[param.name] = value
+            param_index += 1
+        if keep_from is None:
+            keep_from = min(param_index, len(params))
 
         kwonly = False
         newparams = []
-        for param in params[skip:]:
+        for param in params[keep_from:]:
             kind = param.kind
             default = param.default
-            if kind == param.VAR_KEYWORD:
+            if kind == inspect.Parameter.VAR_KEYWORD:
                 pass
-            elif kind == param.VAR_POSITIONAL:
+            elif kind == inspect.Parameter.VAR_POSITIONAL:
                 if kwonly:
                     continue
-            elif param.name in keywords:
+            elif param.name in keywords and keywords[param.name] is not _:
                 default = keywords[param.name]
-                kind = param.KEYWORD_ONLY
+                kind = inspect.Parameter.KEYWORD_ONLY
+                kwonly = True
+            elif param.name in forced_kwonly:
+                default = forced_kwonly[param.name]
+                kind = inspect.Parameter.KEYWORD_ONLY
                 kwonly = True
             else:
                 if kwonly:
-                    kind = param.KEYWORD_ONLY
-                if default is param.empty:
+                    kind = inspect.Parameter.KEYWORD_ONLY
+                if default is inspect.Parameter.empty:
                     default = no_default
             newparams.append(param.replace(default=default, kind=kind))
 
@@ -272,11 +374,11 @@ class curry:
 
     @instanceproperty
     def args(self):
-        return self._partial.args
+        return self._curry_args
 
     @instanceproperty
     def keywords(self):
-        return self._partial.keywords
+        return self._curry_keywords
 
     @instanceproperty
     def func_name(self):
@@ -301,8 +403,19 @@ class curry:
         return not self.__eq__(other)
 
     def __call__(self, *args, **kwargs):
+        if self._has_holes or any(arg is _ for arg in args) or any(
+                value is _ for value in kwargs.values()):
+            args, kwargs, state = self._merge_holes(args, kwargs)
+            if state != 'complete':
+                return self._bind_merged(args, kwargs, state != 'unfilled')
+            if kwargs:
+                return self._curry_func(*args, **kwargs)
+            return self._curry_func(*args)
         try:
-            return self._partial(*args, **kwargs)
+            if self.keywords:
+                return self._curry_func(*self.args, *args,
+                                  **dict(self.keywords, **kwargs))
+            return self._curry_func(*self.args, *args, **kwargs)
         except TypeError as exc:
             if self._should_curry(args, kwargs, exc):
                 return self.bind(*args, **kwargs)
@@ -310,9 +423,9 @@ class curry:
 
     def _should_curry(self, args, kwargs, exc=None):
         func = self.func
-        args = self.args + args
         if self.keywords:
             kwargs = dict(self.keywords, **kwargs)
+        args = self.args + args
         if self._sigspec is None:
             sigspec = self._sigspec = _sigs.signature_or_spec(func)
             self._has_unknown_args = has_varargs(func, sigspec) is not False
@@ -335,10 +448,141 @@ class curry:
             return False
 
     def bind(self, *args, **kwargs):
+        if self._has_holes or any(arg is _ for arg in args) or any(
+                value is _ for value in kwargs.values()):
+            args, kwargs, state = self._merge_holes(args, kwargs)
+            return self._bind_merged(args, kwargs, state != 'complete')
         return type(self)(self, *args, **kwargs)
 
     def call(self, *args, **kwargs):
-        return self._partial(*args, **kwargs)
+        if self._has_holes or any(arg is _ for arg in args) or any(
+                value is _ for value in kwargs.values()):
+            args, kwargs, state = self._merge_holes(args, kwargs)
+            if state == 'unfilled':
+                raise TypeError(
+                    'Not enough arguments to fill the placeholder slots')
+        elif self.keywords:
+            kwargs = dict(self.keywords, **kwargs)
+            args = self.args + args
+        else:
+            args = self.args + args
+        if kwargs:
+            return self._curry_func(*args, **kwargs)
+        return self._curry_func(*args)
+
+    def _bind_merged(self, args, kwargs, has_holes):
+        obj = type(self).__new__(type(self))
+        obj._curry_func = self._curry_func
+        obj._curry_args = args
+        obj._curry_keywords = kwargs
+        obj._has_holes = bool(has_holes)
+        obj.__doc__ = self.__doc__
+        obj.__name__ = self.__name__
+        obj.__module__ = self.__module__
+        obj.__qualname__ = self.__qualname__
+        obj._sigspec = self._sigspec
+        obj._has_unknown_args = self._has_unknown_args
+        return obj
+
+    def _merge_holes(self, args, kwargs):
+        """Merge new args/kwargs into a pattern that may contain ``_``.
+
+        New positional arguments fill open slots from left to right; values
+        left over are appended after the existing positional pattern.  New
+        keyword arguments first fill positional-or-keyword slots that are
+        still open (matched through the function signature) and are then
+        merged into the keyword mapping.  Raises ``TypeError`` if the merge
+        binds the same parameter more than once.
+        """
+        pattern = list(self.args)
+        keywords = dict(self.keywords)
+
+        new_args = list(args)
+        n_open_before = sum(value is _ for value in pattern)
+        for i, value in enumerate(pattern):
+            if value is _ and new_args:
+                pattern[i] = new_args.pop(0)
+        n_leftovers = len(new_args)
+        pattern.extend(new_args)
+
+        claimed = self._claim_holes_by_keyword(pattern, keywords, kwargs)
+
+        for name, value in kwargs.items():
+            if name in keywords and keywords[name] is not _:
+                if value is not _:
+                    raise TypeError(
+                        f"got multiple values for keyword argument {name!r}")
+
+            keywords[name] = value
+
+        args = tuple(pattern)
+        has_holes = any(value is _ for value in args) or any(
+            value is _ for value in keywords.values())
+        self._validate_hole_pattern(args, keywords, claimed)
+        if has_holes:
+            return args, keywords, 'unfilled'
+        if (n_open_before > 0 and n_leftovers > 0
+                and self._has_varargs(args, kwargs)):
+            # Every placeholder was filled and extra positional arguments
+            # spilled into ``*args``; stay curried, mirroring the usual
+            # behaviour for signatures with variadic positional arguments.
+            return args, keywords, 'curried'
+        return args, keywords, 'complete'
+
+    def _has_varargs(self, args, kwargs):
+        sigspec = self._get_sigspec()
+        if isinstance(sigspec, inspect.Signature):
+            return any(p.kind == inspect.Parameter.VAR_POSITIONAL
+                       for p in sigspec.parameters.values())
+        return self._has_unknown_args or False
+
+    def _claim_holes_by_keyword(self, pattern, keywords, new_kwargs):
+        """Let keyword arguments fill open positional-or-keyword slots."""
+        sigspec = self._get_sigspec()
+        claimed = set()
+        if not isinstance(sigspec, inspect.Signature):
+            return claimed
+        pos_names = [
+            p.name for p in sigspec.parameters.values()
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        ]
+        for name, value in list(new_kwargs.items()):
+            if value is _ or name not in pos_names:
+                continue
+            target = pos_names.index(name)
+            if target >= len(pattern) or pattern[target] is not _:
+                continue
+            if name in keywords and keywords[name] is not _:
+                raise TypeError(
+                    f"got multiple values for keyword argument {name!r}")
+            pattern[target] = value
+            claimed.add(target)
+            del new_kwargs[name]
+        return claimed
+
+    def _get_sigspec(self):
+        if self._sigspec is None:
+            self._sigspec = _sigs.signature_or_spec(self._curry_func)
+            self._has_unknown_args = has_varargs(
+                self._curry_func, self._sigspec) is not False
+        return self._sigspec
+
+    def _validate_holes(self):
+        self._validate_hole_pattern(self._curry_args, self._curry_keywords, set())
+
+    def _validate_hole_pattern(self, args, kwargs, claimed):
+        """Ensure the pattern could still be completed by later arguments."""
+        sigspec = self._get_sigspec()
+        if not isinstance(sigspec, inspect.Signature):
+            return
+        dummy = object()
+        check_args = tuple(
+            dummy if (value is _ and i not in claimed) else value
+            for i, value in enumerate(args))
+        check_kwargs = {
+            name: (dummy if value is _ else value)
+            for name, value in kwargs.items()}
+        sigspec.bind_partial(*check_args, **check_kwargs)
 
     def __get__(self, instance, owner):
         if instance is None:
@@ -370,7 +614,8 @@ class curry:
 
         # functools.partial objects can't be pickled
         userdict = tuple((k, v) for k, v in self.__dict__.items()
-                         if k not in ('_partial', '_sigspec'))
+                         if k not in ('_curry_func', '_curry_args', '_curry_keywords',
+                                      '_sigspec'))
         state = (type(self), func, self.args, self.keywords, userdict,
                  is_decorated)
         return _restore_curry, state
