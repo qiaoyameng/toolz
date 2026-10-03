@@ -1,4 +1,5 @@
 import itertools
+import operator
 from itertools import starmap
 from toolz.utils import raises
 from functools import partial
@@ -10,7 +11,7 @@ from toolz.itertoolz import (remove, groupby, merge_sorted,
                              mapcat, isdistinct, first, second,
                              nth, take, tail, drop, interpose, get,
                              rest, last, cons, frequencies,
-                             reduceby, iterate, accumulate,
+                             reduceby, iterate, accumulate, scan,
                              sliding_window, count, partition,
                              partition_all, take_nth, pluck, join,
                              diff, topk, peek, peekn, random_sample)
@@ -323,6 +324,211 @@ def test_accumulate():
 
 def test_accumulate_works_on_consumable_iterables():
     assert list(accumulate(add, iter((1, 2, 3)))) == [1, 3, 6]
+
+
+def matmul(left, right):
+    return tuple(
+        tuple(
+            sum(left[row][index] * right[index][column]
+                for index in range(2))
+            for column in range(2)
+        )
+        for row in range(2)
+    )
+
+
+class ImmediateFuture:
+    def __init__(self, executor, func, args):
+        self.executor = executor
+        self.canceled = False
+        try:
+            self.value = func(*args)
+        except BaseException as exc:
+            self.exception = exc
+        else:
+            self.exception = None
+
+    def result(self):
+        self.executor.unconsumed -= 1
+        if self.exception is not None:
+            raise self.exception
+        return self.value
+
+    def cancel(self):
+        self.canceled = True
+
+
+class ImmediateExecutor:
+    def __init__(self):
+        self.submitted = 0
+        self.unconsumed = 0
+        self.max_unconsumed = 0
+        self.futures = []
+
+    def submit(self, func, *args):
+        self.submitted += 1
+        self.unconsumed += 1
+        self.max_unconsumed = max(self.max_unconsumed, self.unconsumed)
+        future = ImmediateFuture(self, func, args)
+        self.futures.append(future)
+        return future
+
+
+class TrackingIterator:
+    def __init__(self, values):
+        self.values = iter(values)
+        self.reads = 0
+        self.closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        value = next(self.values)
+        self.reads += 1
+        return value
+
+    def close(self):
+        self.closed = True
+
+
+class FailingFuture:
+    def __init__(self, executor):
+        self.executor = executor
+        self.canceled = False
+
+    def result(self):
+        raise RuntimeError('block failed')
+
+    def cancel(self):
+        self.canceled = True
+
+
+class FailingExecutor:
+    def __init__(self):
+        self.submitted = 0
+        self.futures = []
+
+    def submit(self, func, *args):
+        self.submitted += 1
+        future = FailingFuture(self)
+        self.futures.append(future)
+        return future
+
+
+def test_scan_modes_and_empty_input():
+    assert list(scan(add, [1, 2, 3, 4])) == [1, 3, 6, 10]
+    assert list(scan(add, [1, 2, 3, 4], 0)) == [0, 1, 3, 6, 10]
+    assert list(scan(add, [1, 2, 3, 4], 0, exclusive=True)) == [0, 1, 3, 6]
+    assert list(scan(add, [])) == []
+    assert list(scan(add, [], 0)) == [0]
+    assert list(scan(add, [], 0, exclusive=True)) == []
+    assert raises(ValueError, lambda: list(scan(add, [], exclusive=True)))
+
+
+def test_scan_matches_accumulate_for_noncommutative_operations():
+    strings = ['a', 'b', 'c', 'd', 'e']
+    identity = ((1, 0), (0, 1))
+    matrices = [
+        ((1, 2), (3, 4)),
+        ((2, 0), (1, 2)),
+        ((0, 1), (1, 0)),
+        ((3, 1), (0, 2)),
+        ((1, 1), (1, 0)),
+    ]
+
+    for binop, values, initial in (
+        (operator.add, strings, ''),
+        (matmul, matrices, identity),
+    ):
+        inclusive = list(accumulate(binop, values))
+        with_initial = list(accumulate(binop, values, initial))
+        exclusive = with_initial[:-1]
+        for chunksize in (1, 2, 3, 5, 7):
+            assert list(
+                scan(binop, values, chunksize=chunksize)
+            ) == inclusive
+            assert list(scan(
+                binop, values, initial, chunksize=chunksize
+            )) == with_initial
+            assert list(scan(
+                binop, values, initial,
+                chunksize=chunksize, exclusive=True
+            )) == exclusive
+
+
+def test_scan_consumes_iterator_once():
+    source = TrackingIterator([1, 2, 3, 4])
+
+    assert list(scan(add, source, 0, chunksize=2)) == [0, 1, 3, 6, 10]
+    assert source.reads == 4
+
+
+def test_scan_uses_executor_while_preserving_order_and_block_boundaries():
+    values = ['a', 'b', 'c', 'd', 'e']
+    executor = ImmediateExecutor()
+
+    result = list(scan(
+        operator.add, values, '',
+        chunksize=2, executor=executor, max_in_flight=2
+    ))
+
+    assert result == ['', 'a', 'ab', 'abc', 'abcd', 'abcde']
+    assert executor.submitted == 3
+    assert executor.max_unconsumed == 2
+
+
+def test_scan_limits_prefetch_and_closes_input_early():
+    source = TrackingIterator(range(100))
+    executor = ImmediateExecutor()
+    result_iterator = scan(
+        add, source, 0, chunksize=3, executor=executor,
+        max_in_flight=2
+    )
+
+    assert next(result_iterator) == 0
+    assert source.reads == 0
+    assert executor.submitted == 0
+
+    assert next(result_iterator) == 0
+    assert source.reads == 6
+    assert executor.submitted == 2
+    assert next(result_iterator) == 1
+    assert next(result_iterator) == 3
+    assert source.reads == 6
+
+    assert next(result_iterator) == 6
+    assert source.reads == 9
+    assert executor.submitted == 3
+    assert executor.max_unconsumed == 2
+
+    result_iterator.close()
+
+    assert source.closed
+    assert executor.futures[2].canceled
+
+
+def test_scan_stops_after_failed_block():
+    source = TrackingIterator(range(100))
+    executor = FailingExecutor()
+    result = scan(
+        add, source, chunksize=2, executor=executor, max_in_flight=2
+    )
+
+    assert raises(RuntimeError, lambda: next(result))
+
+    assert source.closed
+    assert source.reads == 4
+    assert executor.submitted == 2
+    assert executor.futures[1].canceled
+
+
+def test_scan_rejects_invalid_limits():
+    assert raises(ValueError, lambda: list(scan(add, [1], chunksize=0)))
+    assert raises(
+        ValueError,
+        lambda: list(scan(add, [1], max_in_flight=0))
+    )
 
 
 def test_sliding_window():

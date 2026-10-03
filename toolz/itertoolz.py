@@ -9,11 +9,13 @@ from toolz.utils import no_default
 
 
 __all__ = ('remove', 'accumulate', 'groupby', 'merge_sorted', 'interleave',
-           'unique', 'isiterable', 'isdistinct', 'take', 'drop', 'take_nth',
+           'unique', 'isiterable', 'isdistinct', 'take', 'drop',
+           'take_nth',
            'first', 'second', 'nth', 'last', 'get', 'concat', 'concatv',
-           'mapcat', 'cons', 'interpose', 'frequencies', 'reduceby', 'iterate',
-           'sliding_window', 'partition', 'partition_all', 'count', 'pluck',
-           'join', 'tail', 'diff', 'topk', 'peek', 'peekn', 'random_sample')
+           'mapcat', 'scan', 'cons', 'interpose', 'frequencies',
+           'reduceby', 'iterate', 'sliding_window', 'partition',
+           'partition_all', 'count', 'pluck', 'join', 'tail', 'diff',
+           'topk', 'peek', 'peekn', 'random_sample')
 
 
 def remove(predicate, seq):
@@ -66,6 +68,158 @@ def accumulate(binop, seq, initial=no_default):
     for elem in seq:
         result = binop(result, elem)
         yield result
+
+
+def _scan_chunk(binop, chunk, exclusive):
+    prefixes = [chunk[0]]
+    result = chunk[0]
+    for item in chunk[1:]:
+        result = binop(result, item)
+        if not exclusive:
+            prefixes.append(result)
+    if exclusive:
+        return chunk, None
+    return chunk, prefixes
+
+
+def scan(binop, seq, initial=no_default, *, exclusive=False, chunksize=None,
+         executor=None, max_in_flight=1):
+    """ Compute ordered prefixes with an associative binary operation
+
+    By default this is an inclusive scan:
+
+    >>> list(scan(operator.add, [1, 2, 3, 4]))
+    [1, 3, 6, 10]
+
+    With ``initial``, the inclusive result starts with that value:
+
+    >>> list(scan(operator.add, [1, 2, 3], 0))
+    [0, 1, 3, 6]
+
+    Pass ``exclusive=True`` to emit the prefix before each input. An initial
+    value is required in that case:
+
+    >>> list(scan(operator.add, [1, 2, 3], 0, exclusive=True))
+    [0, 1, 3]
+    >>> list(scan(operator.add, [], 0))
+    [0]
+    >>> list(scan(operator.add, [], 0, exclusive=True))
+    []
+
+    ``binop`` must be associative. It need not be commutative; prefixes are
+    always combined in the original input order. When ``executor`` is given,
+    each block independently computes its local prefixes. The executor only
+    needs ``submit(func, *args)`` returning an object with ``result()`` and
+    ``cancel()`` methods, matching ``concurrent.futures`` executors.
+
+    ``chunksize`` defaults to 128 for executor-driven scans. At most
+    ``max_in_flight`` block tasks are submitted before earlier results are
+    consumed. The input iterator is consumed once, and closing the scan early
+    or receiving a failed block cancels pending work without submitting more.
+
+    Parameters
+    ----------
+    binop : callable
+        Associative operation. It is not required to be commutative.
+    seq : iterable
+        Input values, consumed once in their original order.
+    initial
+        Initial value for the scan. Required when ``exclusive`` is true.
+    exclusive : bool, optional
+        Return prefixes before each input rather than through each input.
+    chunksize : int, optional
+        Number of input values in each independently computed block.
+    executor : object, optional
+        Executor with a ``submit`` method following
+        ``concurrent.futures.Executor``.
+    max_in_flight : int, optional
+        Maximum number of submitted block results waiting to be consumed.
+    """
+    if exclusive and initial is no_default:
+        raise ValueError('exclusive scan requires an initial value')
+    if chunksize is None:
+        chunksize = 128 if executor is not None else None
+    elif not isinstance(chunksize, int) or chunksize <= 0:
+        raise ValueError('chunksize must be a positive integer')
+    if not isinstance(max_in_flight, int) or max_in_flight <= 0:
+        raise ValueError('max_in_flight must be a positive integer')
+
+    if executor is None:
+        if chunksize is None:
+            if exclusive:
+                seq = iter(seq)
+                result = initial
+                for item in seq:
+                    yield result
+                    result = binop(result, item)
+            else:
+                yield from accumulate(binop, seq, initial)
+            return
+
+        seq = iter(seq)
+        if not exclusive and initial is not no_default:
+            yield initial
+        while True:
+            chunk = list(itertools.islice(seq, chunksize))
+            if not chunk:
+                break
+            items, prefixes = _scan_chunk(binop, chunk, exclusive)
+            if exclusive:
+                for item in items:
+                    yield initial
+                    initial = binop(initial, item)
+            elif initial is no_default:
+                yield from prefixes
+                initial = prefixes[-1]
+            else:
+                for prefix in prefixes:
+                    yield binop(initial, prefix)
+                initial = binop(initial, prefixes[-1])
+        return
+
+    seq = iter(seq)
+    pending = collections.deque()
+
+    def submit_chunk():
+        chunk = list(itertools.islice(seq, chunksize))
+        if not chunk:
+            return False
+        pending.append(executor.submit(_scan_chunk, binop, chunk, exclusive))
+        return True
+
+    try:
+        if not exclusive and initial is not no_default:
+            yield initial
+
+        for _ in range(max_in_flight):
+            if not submit_chunk():
+                break
+
+        while pending:
+            future = pending.popleft()
+            items, prefixes = future.result()
+
+            if exclusive:
+                for item in items:
+                    yield initial
+                    initial = binop(initial, item)
+            elif initial is no_default:
+                yield from prefixes
+                initial = prefixes[-1]
+            else:
+                for prefix in prefixes:
+                    yield binop(initial, prefix)
+                initial = binop(initial, prefixes[-1])
+
+            while len(pending) < max_in_flight:
+                if not submit_chunk():
+                    break
+    finally:
+        for future in pending:
+            future.cancel()
+        close = getattr(seq, 'close', None)
+        if callable(close):
+            close()
 
 
 def groupby(key, seq):

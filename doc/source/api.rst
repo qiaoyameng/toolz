@@ -39,6 +39,7 @@ Itertoolz
    random_sample
    reduceby
    remove
+   scan
    second
    sliding_window
    tail
